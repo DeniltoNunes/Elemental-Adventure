@@ -1,0 +1,27 @@
+# Visual Studio
+.vs/
+Debug/
+Release/
+x64/
+x86/
+ipch/
+*.user
+*.suo
+
+# NuGet
+packages/
+*.nupkg
+
+# Compilação
+*.obj
+*.pdb
+*.ilk
+*.pch
+*.idb
+*.exe
+*.dll
+*.log
+
+# Temporários
+*.tmp
+*.bak

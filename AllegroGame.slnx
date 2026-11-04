@@ -1,0 +1,10 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Folder Name="/Assets/">
+    <File Path="../../../Downloads/Cute_Fantasy_Free/Player/Player.png" />
+  </Folder>
+  <Project Path="JogoPI/JogoPI.vcxproj" Id="3d8e9edf-43bb-4568-9950-ce6e6a797b21" />
+</Solution>
