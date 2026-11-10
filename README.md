@@ -11,5 +11,8 @@ Histórico de Versões:
 -  08/10 - Parte interna da casa/Melhora da parte externa/Melhora do sistema de hitbox - Matheus
 
 TAREFAS NÃO REALIZADAS (Já atribuídas):
-- Menu inicial
+- Menu inicial - Felipe Lula
 - Segunda fase - Felipe Lula
+
+TAREFAS SEM ATRIBUIÇÃO:
+Consultar Trello: https://trello.com/b/2xFBe1WE/elemental-adventure
