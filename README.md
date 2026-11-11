@@ -9,10 +9,13 @@ Histórico de Versões:
 -  09/10 - Correção tamanhos e animações (Incluso correções de HitBox e padronização de escala) - Denilton Nunes
 -  19/10 - Hud Implementada (incluso interface visual de perca de vida) - Matheus
 -  08/10 - Parte interna da casa/Melhora da parte externa/Melhora do sistema de hitbox - Matheus
+-  06/11 - Encontro dos assets da segunda fase
+-  07/11 - desenvolvimento da segunda fase
+-  08/11 - desenvolvimento do menu inicial
+-  10/11 - desenvolvimento da logica de mineração
 
 TAREFAS NÃO REALIZADAS (Já atribuídas):
-- Menu inicial - Felipe Lula
-- Segunda fase - Felipe Lula
+- desenvolver entrega do minério na bancada
 
 TAREFAS SEM ATRIBUIÇÃO:
 Consultar Trello: https://trello.com/b/2xFBe1WE/elemental-adventure
