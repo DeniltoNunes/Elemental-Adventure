@@ -1,8 +1,12 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
+#include <string.h>
+#include <time.h>
 #include <allegro5/allegro.h>
 #include <allegro5/allegro_primitives.h>
 #include <allegro5/allegro_image.h>
+
 
 
 // ============================================================
@@ -12,7 +16,6 @@
 #define LARGURA_TELA 1280
 #define ALTURA_TELA  720
 
-#define NUM_SLIMES   2
 #define NUM_ARVORES  4
 #define NUM_ARVORES_PEQ 3
 
@@ -26,6 +29,7 @@
 #define VIDA_MAXIMA_PLAYER 5
 #define VIDA_MAXIMA_SLIME  2
 #define TEMPO_INVULNERAVEL 60 // 1 segundo (60 frames)
+#define RAIO_PERSEGUIR_SLIME 260.0f // distância em que o slime começa a perseguir o jogador
 
 // Configurações do Inventário HUD
 #define NUM_SLOTS    9
@@ -62,7 +66,7 @@
 #define CURRAL_LINHAS    4
 
 #define NUM_ANIMAIS      4
-#define MAX_SOLIDOS      64    // máximo de objetos sólidos por cena
+#define MAX_SOLIDOS      256   // (era 64)   // máximo de objetos sólidos por cena
 #define MAX_SPRITES      64    // máximo de sprites fixos do cenário exterior
 
 // Postes de luz e baú do exterior
@@ -103,6 +107,8 @@ typedef struct {
     int contador_ataque;
     int ultima_direcao; // 0 = baixo, 1 = direita, 2 = cima, 3 = esquerda
     int ataque_acertou;
+    int usando_picareta; // 1 = o golpe atual é na picareta (tecla Q); 0 = espada (tecla E)
+    ALLEGRO_BITMAP* sprite_acoes; // folha Player_Actions.png (animação da picareta)
 
     // Hitbox
     int hit_x, hit_y, hit_w, hit_h;
@@ -183,7 +189,7 @@ typedef struct {
 } ListaCenario;
 
 // Uma entrada da fila de desenho do exterior
-typedef enum { ITEM_CENARIO, ITEM_ANIMAL, ITEM_SLIME, ITEM_PLAYER } TipoItem;
+typedef enum { ITEM_CENARIO, ITEM_ANIMAL, ITEM_PLAYER } TipoItem;
 
 typedef struct {
     float base_y;
@@ -191,7 +197,7 @@ typedef struct {
     int indice;
 } ItemDesenho;
 
-typedef enum { CENA_EXTERIOR, CENA_INTERIOR } Cena;
+typedef enum { CENA_EXTERIOR, CENA_INTERIOR, CENA_CAVERNA } Cena;
 
 
 // ============================================================
@@ -208,11 +214,13 @@ Retangulo caixa_solido(const ObjetoSolido* s);
 int ha_solido_em(const ListaSolidos* lista, float x, float y, float w, float h, const float* ignorar);
 
 void init_player(Player* p);
-void init_slimes(Slime slimes[]);
 
 void atualizar_player(Player* p, Slime slimes[], int n_slimes,
     const ListaSolidos* solidos, Retangulo area);
-void atualizar_slimes(Slime slimes[], Player* p, const ListaSolidos* solidos);
+void atualizar_slimes(Slime slimes[], int n_slimes, Player* p, const ListaSolidos* solidos, Retangulo area);
+void iniciar_golpe(Player* p, int picareta);
+Retangulo area_golpe(const Player* p);
+void reviver_player(Player* p);
 
 void adicionar_movel(Movel lista[], int* n, ALLEGRO_BITMAP* bmp, float x, float y, int plano, int solido);
 
@@ -229,11 +237,1845 @@ void adicionar_sprite(ListaCenario* lista, ALLEGRO_BITMAP* bmp, float sx, float 
 void montar_cenario(ListaCenario* lista, ALLEGRO_BITMAP* casa, ALLEGRO_BITMAP* arvore,
     ALLEGRO_BITMAP* arvore_peq, ALLEGRO_BITMAP* bau, ALLEGRO_BITMAP* decor, ALLEGRO_BITMAP* cerca,
     Posicao2D arvores[], Posicao2D arvores_peq[], float base_casa);
-void desenhar_exterior(const ListaCenario* cenario, Animal animais[], Slime slimes[],
-    ALLEGRO_BITMAP* slime_sprite, Player* p, ALLEGRO_BITMAP* personagem);
+void desenhar_exterior(const ListaCenario* cenario, Animal animais[], Player* p, ALLEGRO_BITMAP* personagem);
 void desenhar_interior_fundo(ALLEGRO_BITMAP* piso, ALLEGRO_BITMAP* parede_topo, ALLEGRO_BITMAP* parede_base);
 void desenhar_moveis(Movel moveis[], int n, float pes_y, int depois_do_player);
-void desenhar_hud(int slot_selecionado);
+void desenhar_moveis(Movel moveis[], int n, float pes_y, int depois_do_player);
+void desenhar_moveis(Movel moveis[], int n, float pes_y, int depois_do_player);
+
+// Declaração da versão com 3 argumentos
+void desenhar_hud(int slot_selecionado, ALLEGRO_BITMAP* const icones[], const int qtd[], int n_itens);
+
+
+// ============================================================
+// FASE 2: CAVERNA DE MINÉRIO DE FERRO
+// Incluir DEPOIS dos typedefs e protótipos do jogo e ANTES do main().
+// ============================================================
+
+#define CAV_NUM_SLIMES     4
+#define CAV_NUM_VEIOS      6                 // veios de minério espalhados pelo chão
+#define CAV_META_MINERIO   CAV_NUM_VEIOS
+#define CAV_VIDA_VEIO      3                 // golpes de picareta (tecla Q) para quebrar cada veio
+#define CAV_ESC_VEIO       4                 // veio: grade 16x16 desenhada em 64x64
+#define CAV_MAX_DECOR      16
+#define CAV_MAX_POP        8
+#define CAV_CEL            16                // tamanho da célula da parede de pedra
+#define CAV_COLS           (LARGURA_TELA / CAV_CEL)
+#define CAV_LINHAS         (ALTURA_TELA / CAV_CEL)
+#define CAV_PASTA          "assets_cave/Objects_separately/"
+#define CAV_NUM_NIVEIS     3                 // quantos níveis a caverna tem (cada um terá inimigo e minério próprios)
+#define CAV_PASSAGEM_COL0  45                // passagem de CIMA: colunas 45..48 (x 720..783)
+#define CAV_PASSAGEM_COL1  48
+#define CAV_BAIXO_COL0     58                // passagem de BAIXO: colunas 58..61 (x 928..991), fora da barra do inventário
+#define CAV_BAIXO_COL1     61
+
+// Lados da caverna onde pode haver uma passagem com placa
+#define LADO_NENHUM   -1
+#define LADO_ESQUERDA  0
+#define LADO_CIMA      1
+#define LADO_BAIXO     2
+
+// Entrada (placa de VOLTAR) e saída (placa de AVANÇAR) de cada nível.
+// Regra: a entrada de um nível fica no mesmo lado da saída do nível anterior
+// (quem sai por cima chega por cima no próximo). O último nível não tem saída.
+static const int cav_entrada_nivel[CAV_NUM_NIVEIS] = { LADO_ESQUERDA, LADO_CIMA,  LADO_BAIXO };
+static const int cav_saida_nivel[CAV_NUM_NIVEIS]   = { LADO_CIMA,     LADO_BAIXO, LADO_NENHUM };
+
+// Inimigo de cada nível
+#define INIMIGO_SLIME      0
+#define INIMIGO_ESQUELETO  1
+static const int cav_inimigo_nivel[CAV_NUM_NIVEIS] = { INIMIGO_SLIME, INIMIGO_ESQUELETO, INIMIGO_SLIME };
+
+// ------------------------------------------------------------
+// ELEMENTOS QUÍMICOS: cada minério é um elemento de verdade.
+// Cada um tem o seu veio, o seu ícone e o seu slot no inventário (na ordem abaixo).
+// Textos sem acento porque a fonte do jogo não tem acentos.
+// ------------------------------------------------------------
+#define MINERIO_FERRO    0
+#define MINERIO_COBRE    1
+#define MINERIO_ZINCO    2
+#define MINERIO_ESTANHO  3
+#define MINERIO_PRATA    4
+#define MINERIO_OURO     5
+#define MINERIO_URANIO   6
+#define NUM_MINERIOS     7
+
+typedef struct {
+    const char* simbolo;
+    const char* nome;
+    int numero;                     // número atômico
+    const char* uso;                // uma aplicação do dia a dia
+    unsigned char filao[3];         // cor do filão no veio
+    unsigned char brilho[3];        // cor do brilho no veio
+    unsigned char icone[4][3];      // cores do ícone: base, sombra, claro, brilho
+} Elemento;
+
+// As cores dos veios lembram o minério real (malaquita verde = cobre, cassiterita marrom = estanho...)
+static const Elemento ELEMENTOS[NUM_MINERIOS] = {
+    { "Fe", "Ferro",   26, "usado para fazer aco",            {184, 90, 42},  {238,148, 76}, {{112,112,124},{ 72, 72, 84},{190, 95, 45},{236,146, 74}} },
+    { "Cu", "Cobre",   29, "usado em fios eletricos",         { 40,160,140},  {110,225,200}, {{196,112, 64},{136, 72, 38},{232,156, 98},{255,206,160}} },
+    { "Zn", "Zinco",   30, "protege o ferro da ferrugem",     {110,140,180},  {190,212,240}, {{150,160,176},{ 98,106,122},{196,206,222},{236,242,250}} },
+    { "Sn", "Estanho", 50, "com o cobre forma o bronze",      { 96, 66, 46},  {164,124, 92}, {{176,176,170},{118,118,112},{214,214,206},{244,244,238}} },
+    { "Ag", "Prata",   47, "melhor condutor de eletricidade", {196,200,214},  {255,255,255}, {{186,190,204},{126,130,146},{222,226,238},{255,255,255}} },
+    { "Au", "Ouro",    79, "nao enferruja: usado em joias",   {214,160, 32},  {255,228,100}, {{222,172, 44},{156,108, 22},{250,212, 84},{255,244,170}} },
+    { "U",  "Uranio",  92, "combustivel de usinas nucleares", {120,200, 40},  {200,255,110}, {{ 90,150, 60},{ 54, 96, 36},{150,220, 80},{210,255,150}} },
+};
+
+// MISSÃO de cada nível: o elemento que o jogador precisa coletar (o alvo) e os elementos
+// "errados" que aparecem misturados nos veios (os distratores)
+static const int cav_minerio_nivel[CAV_NUM_NIVEIS] = { MINERIO_FERRO, MINERIO_OURO, MINERIO_COBRE };
+static const int cav_distratores[CAV_NUM_NIVEIS][2] = {
+    { MINERIO_COBRE, MINERIO_ZINCO },
+    { MINERIO_PRATA, MINERIO_COBRE },
+    { MINERIO_FERRO, MINERIO_ZINCO },
+};
+#define MISSAO_META      3     // quantos minérios do elemento certo abrem a placa de avançar
+#define MISSAO_ALVOS     3     // quantos dos veios do nível são do elemento certo
+// Como a missão descreve o elemento (sorteado a cada vez que o nível começa)
+#define PISTA_NOME       0
+#define PISTA_NUMERO     1
+#define PISTA_USO        2
+
+// Esqueleto arqueiro (folha Assets/Skeleton_Archer.png, quadros de 32x32 desenhados em 96x96)
+#define CAV_NUM_ESQUELETOS 3
+#define CAV_MAX_FLECHAS    12
+#define ESQ_VIDA           3          // golpes de espada para matar
+#define ESQ_VELOCIDADE     0.9f
+#define ESQ_VISAO          380.0f     // a partir dessa distância ele vê o jogador
+#define ESQ_DIST_MIN       150.0f     // mais perto que isso, ele recua
+#define ESQ_DIST_MAX       270.0f     // mais longe que isso, ele se aproxima
+#define ESQ_ALCANCE_TIRO   340.0f     // só atira se o jogador estiver a até essa distância
+#define ESQ_RECARGA        100        // quadros entre um tiro e outro
+#define FLECHA_VELOCIDADE  5.0f
+
+enum {
+    CAV_IMG_ROCHA_G, CAV_IMG_ROCHA_M, CAV_IMG_ROCHA_P,
+    CAV_IMG_CRISTAL_M, CAV_IMG_CRISTAL_P,
+    CAV_IMG_COGUMELO, CAV_IMG_FOGUEIRA, CAV_IMG_ESQUELETO,
+    CAV_NUM_IMGS
+};
+
+typedef struct {
+    ALLEGRO_BITMAP* bmp;
+    float x, y, w, h;
+    float base_y;       // linha do "pé" para ordenar a profundidade
+} CavDecor;
+
+// Veio de minério de ferro no chão: o jogador bate com a picareta (Q) até quebrar
+typedef struct {
+    float x, y, w, h;
+    int vida;           // golpes restantes
+    int ativo;          // 1 = ainda no chão
+    int idx_solido;     // posição na lista de sólidos (para liberar a passagem ao quebrar)
+    float sol_x;        // x original da hitbox (para restaurar no reset)
+    int flash, tremor;  // efeitos ao levar um golpe
+    int elemento;       // qual elemento químico é este veio (MINERIO_FERRO, MINERIO_COBRE...)
+} CavVeio;
+
+typedef struct { float x, y; int t; int elemento; } CavPopup;   // ícone que sobe quando o minério é coletado
+
+// Esqueleto arqueiro: mantém distância do jogador e atira flechas
+typedef struct {
+    float x, y;
+    int vida;               // 0 = morto
+    int morrendo;           // quadros que faltam da animação de morte
+    int dir;                // 0 = baixo, 1 = direita, 2 = cima, 3 = esquerda
+    int andando;
+    int quadro, contador;   // animação de parado/andando
+    int atacando, quadro_ataque, contador_ataque;   // mirar, puxar, soltar
+    int recarga;            // quadros até poder atirar de novo
+    int dano_timer;         // pisca ao levar um golpe
+    int hit_x, hit_y, hit_w, hit_h;
+} Esqueleto;
+
+typedef struct { float x, y, vx, vy; int ativa; } Flecha;
+
+typedef struct {
+    ALLEGRO_BITMAP* fundo;               // chão + paredes de pedra do nível atual (um dos fundos abaixo)
+    ALLEGRO_BITMAP* fundos[CAV_NUM_NIVEIS];   // cada nível tem as passagens em lugares diferentes
+    ALLEGRO_BITMAP* minerio;             // ícone 12x12 do minério do nível atual (um dos abaixo)
+    ALLEGRO_BITMAP* veio_bmp;            // veio 16x16 do minério do nível atual (um dos abaixo)
+    ALLEGRO_BITMAP* minerios[NUM_MINERIOS];   // ícone de cada tipo de minério (inventário)
+    ALLEGRO_BITMAP* veios_img[NUM_MINERIOS];  // veio de cada tipo de minério (gerados por código)
+    ALLEGRO_BITMAP* img[CAV_NUM_IMGS];   // objetos da pasta assets_cave
+
+    CavDecor decor[CAV_MAX_DECOR];
+    int n_decor;
+
+    Slime slimes[CAV_NUM_SLIMES];
+    ALLEGRO_BITMAP* esqueleto_bmp;       // Assets/Skeleton_Archer.png
+    Esqueleto esqueletos[CAV_NUM_ESQUELETOS];
+    Flecha flechas[CAV_MAX_FLECHAS];
+    CavVeio veios[CAV_NUM_VEIOS];
+    CavPopup pop[CAV_MAX_POP];
+    int coletados[NUM_MINERIOS];         // minérios no inventário, por tipo
+
+    // Missão de cada nível (fica guardada por nível, como os veios)
+    int missao_pista[CAV_NUM_NIVEIS];       // PISTA_NOME, PISTA_NUMERO ou PISTA_USO
+    int missao_progresso[CAV_NUM_NIVEIS];   // quantos do elemento certo já foram coletados
+    int missao_erros[CAV_NUM_NIVEIS];       // erros nesta missão (a dica fica mais forte a cada erro)
+    int acertos[NUM_MINERIOS], erros[NUM_MINERIOS];   // por elemento (para a tela final de resultado)
+
+    // Mensagem curta que aparece na tela (reforço ao acertar, correção ao errar, avisos)
+    char aviso[96];
+    int aviso_t;                         // quadros que faltam para sumir
+    int aviso_tipo;                      // 0 = acerto, 1 = erro, 2 = aviso
+
+    unsigned char rocha[CAV_LINHAS][CAV_COLS];   // 1 = célula de pedra (parede), 0 = chão
+
+    ListaSolidos solidos;
+    Retangulo area;    // área permitida para a HITBOX do jogador
+    Retangulo saida;   // placa de VOLTAR (nível anterior; no nível 1, volta para a fazenda)
+    Retangulo proximo; // placa de AVANÇAR (próximo nível)
+    int nivel;         // nível atual, de 1 até CAV_NUM_NIVEIS
+    int mudanca;       // troca de nível pendente durante o fade: +1 avançar, -1 voltar
+
+    // Cada nível fica como o jogador deixou: veios quebrados e slimes mortos não voltam
+    int nivel_visitado[CAV_NUM_NIVEIS];
+    CavVeio veios_salvos[CAV_NUM_NIVEIS][CAV_NUM_VEIOS];
+    Slime slimes_salvos[CAV_NUM_NIVEIS][CAV_NUM_SLIMES];
+    Esqueleto esqueletos_salvos[CAV_NUM_NIVEIS][CAV_NUM_ESQUELETOS];
+} Caverna;
+
+typedef enum { CAV_ITEM_DECOR, CAV_ITEM_VEIO, CAV_ITEM_SLIME, CAV_ITEM_ESQUELETO, CAV_ITEM_PLAYER } CavTipoItem;
+typedef struct { float base_y; CavTipoItem tipo; int indice; } CavItem;
+
+
+// ------------------------------------------------------------
+// PLACA de passagem entre as fases (no lugar da antiga luz)
+// ------------------------------------------------------------
+// r = área que muda de cena quando o jogador pisa nela; a placa é desenhada no meio dela
+#define SETA_ESQUERDA 0
+#define SETA_CIMA     1
+#define SETA_BAIXO    2
+static void desenhar_placa(Retangulo r, int seta) {
+    float cx = r.x + r.w / 2.0f;
+    float pe = r.y + r.h / 2.0f + 24.0f;          // onde o poste encosta no chão
+
+    ALLEGRO_COLOR madeira = al_map_rgb(150, 100, 52);
+    ALLEGRO_COLOR escura = al_map_rgb(86, 54, 26);
+
+    al_draw_filled_ellipse(cx, pe, 16, 5, al_map_rgba(0, 0, 0, 90));                    // sombra
+    al_draw_filled_rectangle(cx - 3, pe - 28, cx + 3, pe, escura);                      // poste
+    al_draw_filled_rectangle(cx - 20, pe - 50, cx + 20, pe - 26, madeira);              // tábua
+    al_draw_rectangle(cx - 20, pe - 50, cx + 20, pe - 26, escura, 2.0f);                // contorno
+    ALLEGRO_COLOR seta_cor = al_map_rgb(245, 235, 210);
+    if (seta == SETA_CIMA) {
+        al_draw_filled_rectangle(cx - 2, pe - 42, cx + 2, pe - 30, seta_cor);                         // haste da seta
+        al_draw_filled_triangle(cx - 8, pe - 40, cx + 8, pe - 40, cx, pe - 48, seta_cor);           // ponta da seta
+    }
+    else if (seta == SETA_BAIXO) {
+        al_draw_filled_rectangle(cx - 2, pe - 46, cx + 2, pe - 34, seta_cor);                         // haste da seta
+        al_draw_filled_triangle(cx - 8, pe - 36, cx + 8, pe - 36, cx, pe - 28, seta_cor);           // ponta da seta
+    }
+    else {
+        al_draw_filled_rectangle(cx - 10, pe - 40, cx + 12, pe - 36, seta_cor);                       // haste da seta
+        al_draw_filled_triangle(cx - 16, pe - 38, cx - 8, pe - 45, cx - 8, pe - 31, seta_cor);      // ponta da seta
+    }
+}
+
+// ------------------------------------------------------------
+// Ruído e geração do fundo da caverna
+// ------------------------------------------------------------
+static unsigned cav_hash(int x, int y) {
+    unsigned h = (unsigned)x * 73856093u ^ (unsigned)y * 19349663u;
+    h ^= h >> 13;
+    h *= 0x5bd1e995u;
+    h ^= h >> 15;
+    return h;
+}
+
+static float cav_aleat(int x, int y) {
+    return (float)(cav_hash(x, y) & 0xFFFFu) / 65535.0f;
+}
+
+// Ruído suave (0..1): manchas grandes e pequenas, sempre iguais
+static float cav_ruido(float x, float y) {
+    int ix = (int)floorf(x), iy = (int)floorf(y);
+    float fx = x - ix, fy = y - iy;
+    fx = fx * fx * (3.0f - 2.0f * fx);
+    fy = fy * fy * (3.0f - 2.0f * fy);
+    float a = cav_aleat(ix, iy), b = cav_aleat(ix + 1, iy);
+    float c = cav_aleat(ix, iy + 1), d = cav_aleat(ix + 1, iy + 1);
+    float topo = a + (b - a) * fx;
+    float base = c + (d - c) * fx;
+    return topo + (base - topo) * fy;
+}
+
+static float cav_ruido1(float x, int sem) { return cav_ruido(x, (float)sem); }
+
+// Diz se uma célula de 16x16 é parede de pedra. O MESMO mapa é usado para desenhar
+// e para colidir, então o que você vê é exatamente o que bloqueia.
+// "abertos" diz quais passagens este nível tem (1 bit por lado: LADO_ESQUERDA, LADO_CIMA, LADO_BAIXO)
+static int cav_calc_rocha(int cx, int cy, int abertos) {
+    // passagem no teto
+    if ((abertos & (1 << LADO_CIMA)) && cx >= CAV_PASSAGEM_COL0 && cx <= CAV_PASSAGEM_COL1 && cy < 16) return 0;
+
+    // passagem no chão de baixo
+    if ((abertos & (1 << LADO_BAIXO)) && cx >= CAV_BAIXO_COL0 && cx <= CAV_BAIXO_COL1 && cy >= 30) return 0;
+
+    // teto irregular (linhas 10 a 13)
+    int topo = 10 + (int)(cav_ruido1(cx * 0.35f, 1) * 3.99f);
+    if (cy < topo) return 1;
+
+    // chão de baixo irregular
+    int fundo = 40 - (int)(cav_ruido1(cx * 0.40f, 2) * 2.99f);
+    if (cy >= fundo) return 1;
+
+    // parede esquerda: boca da caverna aberta nas linhas 19..29 (se o nível tiver essa passagem), com "ombros" de pedra
+    int esq;
+    int boca = (abertos & (1 << LADO_ESQUERDA)) != 0;
+    if (!boca) esq = 1 + (int)(cav_ruido1(cy * 0.40f, 3) * 2.99f);
+    else if (cy >= 19 && cy <= 29) esq = 0;
+    else if (cy == 17 || cy == 18 || cy == 30 || cy == 31) esq = 3;
+    else esq = 1 + (int)(cav_ruido1(cy * 0.40f, 3) * 2.99f);
+    if (cx < esq) return 1;
+
+    // parede direita irregular
+    int dir = 1 + (int)(cav_ruido1(cy * 0.40f, 4) * 2.99f);
+    if (cx >= CAV_COLS - dir) return 1;
+
+    // pilares / colunas de pedra (x, y, raio em pixels)
+    static const float pil[3][3] = { { 800, 330, 30 },{ 1190, 450, 34 },{ 140, 540, 36 } };
+    float px = cx * (float)CAV_CEL + CAV_CEL / 2.0f;
+    float py = cy * (float)CAV_CEL + CAV_CEL / 2.0f;
+    for (int k = 0; k < 3; k++) {
+        float dx = px - pil[k][0], dy = py - pil[k][1];
+        float r = pil[k][2] + (cav_ruido(cx * 0.45f + k * 17.0f, cy * 0.45f) - 0.5f) * 18.0f;
+        if (dx * dx + dy * dy < r * r) return 1;
+    }
+    return 0;
+}
+
+// Passagens abertas no nível n (entrada e saída)
+static int cav_abertos(int nivel) {
+    int abertos = 0;
+    if (cav_entrada_nivel[nivel - 1] != LADO_NENHUM) abertos |= 1 << cav_entrada_nivel[nivel - 1];
+    if (cav_saida_nivel[nivel - 1] != LADO_NENHUM) abertos |= 1 << cav_saida_nivel[nivel - 1];
+    return abertos;
+}
+
+static void cav_montar_rocha(Caverna* c) {
+    int abertos = cav_abertos(c->nivel);
+    for (int cy = 0; cy < CAV_LINHAS; cy++)
+        for (int cx = 0; cx < CAV_COLS; cx++)
+            c->rocha[cy][cx] = (unsigned char)cav_calc_rocha(cx, cy, abertos);
+}
+
+// Lê o mapa com segurança (fora da tela repete a célula da borda)
+static int cav_r(const Caverna* c, int cx, int cy) {
+    if (cx < 0) cx = 0;
+    if (cx >= CAV_COLS) cx = CAV_COLS - 1;
+    if (cy < 0) cy = 0;
+    if (cy >= CAV_LINHAS) cy = CAV_LINHAS - 1;
+    return c->rocha[cy][cx];
+}
+
+// Transforma as células de pedra em retângulos sólidos (juntando células vizinhas)
+static void cav_solidos_da_rocha(Caverna* c) {
+    unsigned char usado[CAV_LINHAS][CAV_COLS];
+    for (int y = 0; y < CAV_LINHAS; y++)
+        for (int x = 0; x < CAV_COLS; x++) usado[y][x] = 0;
+
+    // só importa a região onde o jogador consegue chegar
+    int x0 = 2, x1 = CAV_COLS - 3, y0 = 6, y1 = CAV_LINHAS - 6;
+
+    for (int cy = y0; cy <= y1; cy++) {
+        for (int cx = x0; cx <= x1; cx++) {
+            if (!c->rocha[cy][cx] || usado[cy][cx]) continue;
+
+            int ex = cx;
+            while (ex + 1 <= x1 && c->rocha[cy][ex + 1] && !usado[cy][ex + 1]) ex++;
+
+            int ey = cy;
+            while (ey + 1 <= y1) {
+                int ok = 1;
+                for (int k = cx; k <= ex; k++) {
+                    if (!c->rocha[ey + 1][k] || usado[ey + 1][k]) { ok = 0; break; }
+                }
+                if (!ok) break;
+                ey++;
+            }
+
+            for (int yy = cy; yy <= ey; yy++)
+                for (int xx = cx; xx <= ex; xx++) usado[yy][xx] = 1;
+
+            adicionar_solido(&c->solidos, (float)(cx * CAV_CEL), (float)(cy * CAV_CEL),
+                (float)((ex - cx + 1) * CAV_CEL), (float)((ey - cy + 1) * CAV_CEL));
+        }
+    }
+}
+
+static void cav_bloco(float x, float y, float w, float h, int tom) {
+    if (tom < 4) tom = 4;
+    if (tom > 250) tom = 250;
+    al_draw_filled_rectangle(x, y, x + w, y + h, al_map_rgb(tom, tom - 3, tom + 4));
+}
+
+// Desenha UMA vez só a caverna inteira: chão de terra e pedra, paredes de rocha com
+// estalactites, estalagmites, poças e pedrinhas
+static ALLEGRO_BITMAP* cav_gerar_fundo(ALLEGRO_DISPLAY* janela, const Caverna* c) {
+    ALLEGRO_BITMAP* fundo = al_create_bitmap(LARGURA_TELA, ALTURA_TELA);
+    if (!fundo) return NULL;
+
+    al_set_target_bitmap(fundo);
+    al_clear_to_color(al_map_rgb(8, 7, 10));
+
+    // ---- 1) chão e rocha (blocos de 4x4 px, estilo pixel art) ----
+    for (int cy = 0; cy < CAV_LINHAS; cy++) {
+        for (int cx = 0; cx < CAV_COLS; cx++) {
+            float x = (float)(cx * CAV_CEL), y = (float)(cy * CAV_CEL);
+
+            if (!c->rocha[cy][cx]) {
+                // chão natural: terra e pedra em manchas irregulares, sem grade de ladrilhos
+                for (int sy = 0; sy < 4; sy++) {
+                    for (int sx = 0; sx < 4; sx++) {
+                        float px = x + sx * 4, py = y + sy * 4;
+                        float n = 0.55f * cav_ruido(px / 70.0f, py / 70.0f)
+                            + 0.30f * cav_ruido(px / 24.0f + 11.0f, py / 24.0f + 7.0f)
+                            + 0.15f * cav_aleat((int)px / 4, (int)py / 4);
+                        int tom = 38 + (int)(n * 28.0f);
+                        if (cav_ruido(px / 110.0f + 31.0f, py / 110.0f + 5.0f) > 0.66f) tom -= 9;   // terra escura
+                        al_draw_filled_rectangle(px, py, px + 4, py + 4, al_map_rgb(tom + 8, tom + 2, tom - 4));
+                    }
+                }
+                continue;
+            }
+
+            // rocha: quem tem chão ao lado/embaixo ganha "face" iluminada; o miolo fica quase preto
+            int sul = !cav_r(c, cx, cy + 1), norte = !cav_r(c, cx, cy - 1);
+            int oeste = !cav_r(c, cx - 1, cy), leste = !cav_r(c, cx + 1, cy);
+            int d_sul = sul ? 1 : (!cav_r(c, cx, cy + 2) ? 2 : 0);
+            int base = (d_sul == 1) ? 54 : (d_sul == 2) ? 36 : 19;
+
+            for (int sx = 0; sx < 4; sx++) {
+                int var = (int)((cav_hash(cx * 4 + sx, cy / 2 + 3) >> 3) % 17u) - 8;   // listras verticais
+                for (int sy = 0; sy < 4; sy++) {
+                    int gr = (int)((cav_hash(cx * 4 + sx, cy * 4 + sy + 99) >> 5) % 7u) - 3;
+                    int tom = base + (d_sul ? var : var / 3) + gr;
+                    cav_bloco(x + sx * 4, y + sy * 4, 4, 4, tom);
+                }
+            }
+
+            if (norte) cav_bloco(x, y, 16, 4, 68);          // topo iluminado
+            if (oeste) cav_bloco(x, y, 4, 16, 58);          // quina iluminada
+            if (leste) cav_bloco(x + 12, y, 4, 16, 52);
+            if (sul)   cav_bloco(x, y + 12, 16, 4, 22);     // sombra na base da parede
+
+            unsigned h = cav_hash(cx, cy * 7 + 1);
+            if (d_sul && (h % 9u) == 0) {                   // rachadura
+                float rx = x + 2 + (float)((h >> 4) % 12u);
+                al_draw_line(rx, y + 2, rx + 2, y + 12, al_map_rgb(18, 15, 22), 2.0f);
+            }
+            if (!d_sul && !norte && !oeste && !leste && (h % 19u) == 0) {   // cristal/minério na rocha funda
+                float sx2 = x + 4.0f * (float)((h >> 8) % 4u);
+                float sy2 = y + 4.0f * (float)((h >> 12) % 4u);
+                int azul = ((h >> 16) & 1u) == 0;
+                al_draw_filled_rectangle(sx2, sy2, sx2 + 4, sy2 + 4, azul ? al_map_rgb(28, 80, 82) : al_map_rgb(96, 52, 26));
+                al_draw_filled_rectangle(sx2 + 1, sy2 + 1, sx2 + 3, sy2 + 3, azul ? al_map_rgb(70, 210, 200) : al_map_rgb(214, 122, 56));
+            }
+        }
+    }
+
+    // ---- 2) detalhes do chão: pedrinhas, rachaduras e poças ----
+    for (int cy = 0; cy < CAV_LINHAS; cy++) {
+        for (int cx = 0; cx < CAV_COLS; cx++) {
+            if (c->rocha[cy][cx]) continue;
+            unsigned h = cav_hash(cx * 3 + 1, cy * 5 + 2);
+            float x = (float)(cx * CAV_CEL), y = (float)(cy * CAV_CEL);
+
+            if ((h % 9u) == 0) {
+                float px = x + 2 + (float)((h >> 4) % 10u), py = y + 2 + (float)((h >> 8) % 10u);
+                al_draw_filled_rectangle(px, py + 2, px + 5, py + 4, al_map_rgb(24, 21, 20));   // sombra
+                al_draw_filled_rectangle(px, py, px + 4, py + 3, al_map_rgb(88, 82, 76));       // pedrinha
+            }
+            if (((h >> 12) % 23u) == 0) {
+                float px = x + 2 + (float)((h >> 4) % 8u), py = y + 2 + (float)((h >> 8) % 8u);
+                al_draw_line(px, py, px + 9, py + 6, al_map_rgb(22, 18, 17), 2.0f);
+            }
+        }
+    }
+
+    static const float pocas[3][4] = { { 560, 560, 42, 14 },{ 1000, 330, 36, 12 },{ 260, 430, 34, 11 } };
+    for (int i = 0; i < 3; i++) {
+        float px = pocas[i][0], py = pocas[i][1], rx = pocas[i][2], ry = pocas[i][3];
+        al_draw_filled_ellipse(px, py, rx, ry, al_map_rgb(22, 34, 46));
+        al_draw_ellipse(px, py, rx, ry, al_map_rgb(66, 92, 108), 1.0f);
+        al_draw_line(px - rx * 0.5f, py - ry * 0.3f, px - rx * 0.1f, py - ry * 0.5f, al_map_rgb(110, 140, 150), 1.0f);
+    }
+
+    // ---- 3) sombras no chão junto das paredes + borda irregular nas laterais ----
+    for (int cy = 0; cy < CAV_LINHAS; cy++) {
+        for (int cx = 0; cx < CAV_COLS; cx++) {
+            if (c->rocha[cy][cx]) continue;
+            float x = (float)(cx * CAV_CEL), y = (float)(cy * CAV_CEL);
+
+            if (cav_r(c, cx, cy - 1)) {
+                static const float a_topo[4] = { 0.50f, 0.34f, 0.20f, 0.09f };
+                for (int i = 0; i < 4; i++)
+                    al_draw_filled_rectangle(x, y + i * 4, x + 16, y + i * 4 + 4, al_map_rgba_f(0, 0, 0, a_topo[i]));
+            }
+            if (cav_r(c, cx - 1, cy)) {
+                static const float a_lado[3] = { 0.38f, 0.20f, 0.08f };
+                for (int i = 0; i < 3; i++)
+                    al_draw_filled_rectangle(x + i * 4, y, x + i * 4 + 4, y + 16, al_map_rgba_f(0, 0, 0, a_lado[i]));
+                for (int k = 0; k < 4; k++) {
+                    unsigned h = cav_hash(cx * 3 + k, cy * 5 + 17);
+                    if ((h % 4u) == 0) cav_bloco(x, y + k * 4, ((h >> 5) & 1u) ? 8.0f : 4.0f, 4, 44);
+                }
+            }
+            if (cav_r(c, cx + 1, cy)) {
+                static const float a_lado[3] = { 0.38f, 0.20f, 0.08f };
+                for (int i = 0; i < 3; i++)
+                    al_draw_filled_rectangle(x + 16 - i * 4 - 4, y, x + 16 - i * 4, y + 16, al_map_rgba_f(0, 0, 0, a_lado[i]));
+                for (int k = 0; k < 4; k++) {
+                    unsigned h = cav_hash(cx * 7 + k, cy * 5 + 41);
+                    if ((h % 4u) == 0) {
+                        float w = ((h >> 5) & 1u) ? 8.0f : 4.0f;
+                        cav_bloco(x + 16 - w, y + k * 4, w, 4, 44);
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- 4) estalactites (descem do teto) e estalagmites (sobem do chão) ----
+    for (int cy = 0; cy < CAV_LINHAS; cy++) {
+        for (int cx = 0; cx < CAV_COLS; cx++) {
+            if (!c->rocha[cy][cx]) continue;
+            float x = (float)(cx * CAV_CEL), y = (float)(cy * CAV_CEL);
+
+            if (!cav_r(c, cx, cy + 1)) {
+                unsigned h = cav_hash(cx * 5 + 2, cy * 3 + 9);
+                if ((h % 4u) == 0) {
+                    float px = x + 3 + (float)((h >> 4) % 10u);
+                    float len = 8 + (float)((h >> 9) % 20u);
+                    float meia = 3 + (float)((h >> 14) % 3u);
+                    float ponta = px + (float)((int)((h >> 17) % 3u) - 1);
+                    al_draw_filled_triangle(px - meia, y + 15, px + meia, y + 15, ponta, y + 16 + len, al_map_rgb(50, 46, 56));
+                    al_draw_line(px - meia + 1, y + 15, ponta, y + 16 + len, al_map_rgb(80, 74, 86), 1.0f);
+                }
+            }
+            if (!cav_r(c, cx, cy - 1)) {
+                unsigned h = cav_hash(cx * 11 + 5, cy * 7 + 3);
+                if ((h % 5u) == 0) {
+                    float px = x + 3 + (float)((h >> 4) % 10u);
+                    float len = 6 + (float)((h >> 9) % 11u);
+                    float meia = 3 + (float)((h >> 14) % 3u);
+                    al_draw_filled_triangle(px - meia, y + 1, px + meia, y + 1, px, y - len, al_map_rgb(70, 66, 76));
+                    al_draw_line(px - meia + 1, y + 1, px, y - len, al_map_rgb(104, 98, 110), 1.0f);
+                }
+            }
+        }
+    }
+
+    al_set_target_backbuffer(janela);
+    return fundo;
+}
+
+// Ícone do minério (inventário), pixel art 12x12.
+// Ferro: pedra cinza com veios cor de ferrugem. Ouro: pepita dourada.
+static ALLEGRO_BITMAP* cav_gerar_minerio(ALLEGRO_DISPLAY* janela, int tipo) {
+    static const char* grade[12] = {
+        "....kkkk....",
+        "..kkggggkk..",
+        ".kggggrgggk.",
+        ".kgggggoggk.",
+        "kgdggrrgggdk",
+        "kggggroggggk",
+        "kgrggggggdgk",
+        "kgorggdgggrk",
+        ".kdgggggrogk",
+        ".kkdgggggdkk",
+        "..kkddddkk..",
+        "....kkkk...."
+    };
+
+    ALLEGRO_BITMAP* bmp = al_create_bitmap(12, 12);
+    if (!bmp) return NULL;
+
+    al_set_target_bitmap(bmp);
+    al_clear_to_color(al_map_rgba(0, 0, 0, 0));
+
+    for (int y = 0; y < 12; y++) {
+        for (int x = 0; x < 12; x++) {
+            ALLEGRO_COLOR c;
+            const unsigned char* rgb;
+            switch (grade[y][x]) {
+            case 'k': c = al_map_rgb(30, 28, 34); al_put_pixel(x, y, c); continue;
+            case 'g': rgb = ELEMENTOS[tipo].icone[0]; break;
+            case 'd': rgb = ELEMENTOS[tipo].icone[1]; break;
+            case 'r': rgb = ELEMENTOS[tipo].icone[2]; break;
+            case 'o': rgb = ELEMENTOS[tipo].icone[3]; break;
+            default: continue;
+            }
+            c = al_map_rgb(rgb[0], rgb[1], rgb[2]);
+            al_put_pixel(x, y, c);
+        }
+    }
+
+    al_set_target_backbuffer(janela);
+    return bmp;
+}
+
+// Veio de minério no chão: pedra com filões de ferro ou de ouro (16x16, desenhado em 64x64)
+static ALLEGRO_BITMAP* cav_gerar_veio(ALLEGRO_DISPLAY* janela, int tipo) {
+    static const char* grade[16] = {
+        "................",
+        "......kkkk......",
+        "....kkhhhgkk....",
+        "...khhggrggdk...",
+        "..khgggrogggdk..",
+        ".khggrgggggoddk.",
+        ".kggroggggggrdk.",
+        "kgggrrgggorgggdk",
+        "kggggggrogggrgdk",
+        "kgorggggggggrodk",
+        "kgrgggdggggggrdk",
+        "kdgggggggorgggdk",
+        ".kdgggrgggggddk.",
+        ".kkddggggggddkk.",
+        "..kkkddddddkkk..",
+        "................"
+    };
+
+    ALLEGRO_BITMAP* bmp = al_create_bitmap(16, 16);
+    if (!bmp) return NULL;
+
+    al_set_target_bitmap(bmp);
+    al_clear_to_color(al_map_rgba(0, 0, 0, 0));
+
+    for (int y = 0; y < 16; y++) {
+        for (int x = 0; x < 16; x++) {
+            ALLEGRO_COLOR c;
+            switch (grade[y][x]) {
+            case 'k': c = al_map_rgb(26, 24, 30);    break;  // contorno
+            case 'g': c = al_map_rgb(104, 104, 116); break;  // rocha
+            case 'h': c = al_map_rgb(150, 150, 162); break;  // brilho da rocha
+            case 'd': c = al_map_rgb(66, 66, 78);    break;  // sombra
+            case 'r': c = al_map_rgb(ELEMENTOS[tipo].filao[0], ELEMENTOS[tipo].filao[1], ELEMENTOS[tipo].filao[2]); break;     // filão
+            case 'o': c = al_map_rgb(ELEMENTOS[tipo].brilho[0], ELEMENTOS[tipo].brilho[1], ELEMENTOS[tipo].brilho[2]); break;  // brilho
+            default: continue;
+            }
+            al_put_pixel(x, y, c);
+        }
+    }
+
+    al_set_target_backbuffer(janela);
+    return bmp;
+}
+
+
+// ------------------------------------------------------------
+// Montagem da fase
+// ------------------------------------------------------------
+// cx = centro do objeto, base_y = onde ele "pisa" no chão
+static void cav_add_decor(Caverna* c, int img, float cx, float base_y, float escala, int solido) {
+    if (c->n_decor >= CAV_MAX_DECOR) return;
+
+    CavDecor* d = &c->decor[c->n_decor++];
+    d->bmp = c->img[img];
+    d->w = al_get_bitmap_width(d->bmp) * escala;
+    d->h = al_get_bitmap_height(d->bmp) * escala;
+    d->x = cx - d->w / 2.0f;
+    d->y = base_y - d->h * 0.92f;
+
+    if (solido) {
+        d->base_y = base_y;
+        // hitbox só na base do objeto
+        adicionar_solido(&c->solidos, d->x + d->w * 0.25f, d->y + d->h * 0.62f, d->w * 0.5f, d->h * 0.30f);
+    }
+    else {
+        d->base_y = d->y + d->h * 0.4f;   // objeto "no chão": fica sempre atrás do jogador
+    }
+}
+
+static void cav_add_veio(Caverna* c, int i, float x, float y) {
+    CavVeio* v = &c->veios[i];
+    v->x = x; v->y = y;
+    v->w = 16.0f * CAV_ESC_VEIO;
+    v->h = 16.0f * CAV_ESC_VEIO;
+    v->sol_x = x + v->w * 0.12f;
+
+    int antes = c->solidos.n;
+    adicionar_solido(&c->solidos, v->sol_x, y + v->h * 0.45f, v->w * 0.76f, v->h * 0.45f);
+    v->idx_solido = (c->solidos.n > antes) ? antes : -1;
+}
+
+static void cav_init_slime(Slime* s, float x, float y, float vel, int lim_esq, int lim_dir) {
+    s->x = x; s->y = y;
+    s->velocidade = vel; s->direcao = 1;
+    s->frame = 0; s->contador = 0;
+    s->limite_esquerda = lim_esq; s->limite_direita = lim_dir;
+    s->vida = VIDA_MAXIMA_SLIME; s->dano_timer = 0;
+    s->hit_x = 16; s->hit_y = 20; s->hit_w = 32; s->hit_h = 28;
+}
+
+static void esq_init(Esqueleto* e, float x, float y) {
+    memset(e, 0, sizeof *e);
+    e->x = x; e->y = y;
+    e->vida = ESQ_VIDA;
+    e->recarga = 60;   // espera um pouco antes do primeiro tiro
+    e->hit_x = 30; e->hit_y = 18; e->hit_w = 36; e->hit_h = 50;
+}
+
+// Prepara o nível atual (c->nivel): inimigos e veios de minério voltam ao começo.
+// É aqui que cada nível escolhe o seu inimigo (tabela cav_inimigo_nivel) e o seu minério.
+static void cav_preparar_nivel(Caverna* c) {
+    int inimigo = cav_inimigo_nivel[c->nivel - 1];
+
+    // Slimes. Nenhum começa perto das passagens (a pelo menos ~200 px de onde o jogador chega)
+    cav_init_slime(&c->slimes[0], 420, 300, 1.0f, 330, 620);
+    cav_init_slime(&c->slimes[1], 700, 470, 1.2f, 620, 900);
+    cav_init_slime(&c->slimes[2], 960, 270, 1.0f, 880, 1150);
+    cav_init_slime(&c->slimes[3], 1100, 300, 1.4f, 1000, 1170);
+    if (inimigo != INIMIGO_SLIME)
+        for (int i = 0; i < CAV_NUM_SLIMES; i++) c->slimes[i].vida = 0;
+
+    // Esqueletos arqueiros (também longe das passagens)
+    esq_init(&c->esqueletos[0], 380, 300);
+    esq_init(&c->esqueletos[1], 620, 520);
+    esq_init(&c->esqueletos[2], 1080, 330);
+    if (inimigo != INIMIGO_ESQUELETO)
+        for (int i = 0; i < CAV_NUM_ESQUELETOS; i++) c->esqueletos[i].vida = 0;
+    for (int i = 0; i < CAV_MAX_FLECHAS; i++) c->flechas[i].ativa = 0;
+
+    for (int i = 0; i < CAV_NUM_VEIOS; i++) {
+        CavVeio* v = &c->veios[i];
+        v->vida = CAV_VIDA_VEIO;
+        v->ativo = 1;
+        v->flash = 0;
+        v->tremor = 0;
+        if (v->idx_solido >= 0) c->solidos.itens[v->idx_solido].x = v->sol_x;   // volta a bloquear
+    }
+    for (int i = 0; i < CAV_MAX_POP; i++) c->pop[i].t = 0;
+
+    // Missão: sorteia quais veios são do elemento certo e como a pista descreve o elemento.
+    // Assim cada partida é diferente e não dá para decorar o lugar certo.
+    int k = c->nivel - 1;
+    int ordem[CAV_NUM_VEIOS];
+    for (int i = 0; i < CAV_NUM_VEIOS; i++) ordem[i] = i;
+    for (int i = CAV_NUM_VEIOS - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        int t = ordem[i]; ordem[i] = ordem[j]; ordem[j] = t;
+    }
+    for (int i = 0; i < CAV_NUM_VEIOS; i++) {
+        c->veios[ordem[i]].elemento = (i < MISSAO_ALVOS) ? cav_minerio_nivel[k] : cav_distratores[k][rand() % 2];
+    }
+    c->missao_pista[k] = rand() % 3;
+    c->missao_progresso[k] = 0;
+    c->missao_erros[k] = 0;
+}
+
+// Mostra uma mensagem curta na tela por alguns segundos
+static void cav_avisar(Caverna* c, int tipo, int quadros, const char* texto) {
+    snprintf(c->aviso, sizeof c->aviso, "%s", texto);
+    c->aviso_tipo = tipo;
+    c->aviso_t = quadros;
+}
+
+// Texto da missão do nível atual, conforme a pista sorteada
+static void cav_texto_missao(const Caverna* c, char* buf, int tam) {
+    const Elemento* e = &ELEMENTOS[cav_minerio_nivel[c->nivel - 1]];
+    int pista = c->missao_pista[c->nivel - 1];
+    if (pista == PISTA_NOME)        snprintf(buf, tam, "Colete %dx: %s", MISSAO_META, e->nome);
+    else if (pista == PISTA_NUMERO) snprintf(buf, tam, "Colete %dx: numero atomico %d", MISSAO_META, e->numero);
+    else                            snprintf(buf, tam, "Colete %dx: %s", MISSAO_META, e->uso);
+}
+
+static int cav_missao_completa(const Caverna* c) {
+    return c->missao_progresso[c->nivel - 1] >= MISSAO_META;
+}
+
+// Área da placa em cada lado da caverna (pisar nela troca de nível)
+static Retangulo cav_placa_do_lado(int lado) {
+    if (lado == LADO_ESQUERDA) return (Retangulo){ 0, 300, 70, 180 };
+    if (lado == LADO_CIMA)
+        return (Retangulo){ CAV_PASSAGEM_COL0 * CAV_CEL, 100, (CAV_PASSAGEM_COL1 - CAV_PASSAGEM_COL0 + 1) * CAV_CEL, 90 };
+    if (lado == LADO_BAIXO)
+        return (Retangulo){ CAV_BAIXO_COL0 * CAV_CEL, 600, (CAV_BAIXO_COL1 - CAV_BAIXO_COL0 + 1) * CAV_CEL, 40 };
+    return (Retangulo){ -1000, -1000, 0, 0 };   // nenhuma placa
+}
+
+// A seta da placa aponta para o lado da passagem
+static int cav_seta_do_lado(int lado) {
+    if (lado == LADO_CIMA) return SETA_CIMA;
+    if (lado == LADO_BAIXO) return SETA_BAIXO;
+    return SETA_ESQUERDA;
+}
+
+// Guarda veios e slimes do nível atual, do jeito que o jogador deixou
+static void cav_guardar_estado(Caverna* c) {
+    int k = c->nivel - 1;
+    memcpy(c->veios_salvos[k], c->veios, sizeof c->veios);
+    memcpy(c->slimes_salvos[k], c->slimes, sizeof c->slimes);
+    memcpy(c->esqueletos_salvos[k], c->esqueletos, sizeof c->esqueletos);
+    c->nivel_visitado[k] = 1;
+}
+
+// Traz de volta veios e slimes guardados; veio já quebrado continua sem bloquear a passagem
+static void cav_restaurar_estado(Caverna* c) {
+    int k = c->nivel - 1;
+    memcpy(c->veios, c->veios_salvos[k], sizeof c->veios);
+    memcpy(c->slimes, c->slimes_salvos[k], sizeof c->slimes);
+    memcpy(c->esqueletos, c->esqueletos_salvos[k], sizeof c->esqueletos);
+    for (int i = 0; i < CAV_NUM_ESQUELETOS; i++) {   // esqueleto que estava morrendo termina morto
+        if (c->esqueletos[i].morrendo > 0) c->esqueletos[i].morrendo = 0;
+        c->esqueletos[i].atacando = 0;
+    }
+    for (int i = 0; i < CAV_MAX_FLECHAS; i++) c->flechas[i].ativa = 0;
+    for (int i = 0; i < CAV_NUM_VEIOS; i++) {
+        CavVeio* v = &c->veios[i];
+        v->flash = 0;
+        v->tremor = 0;
+        if (v->idx_solido >= 0) c->solidos.itens[v->idx_solido].x = v->ativo ? v->sol_x : -10000.0f;
+    }
+    for (int i = 0; i < CAV_MAX_POP; i++) c->pop[i].t = 0;
+}
+
+// Monta o nível atual: paredes com as passagens deste nível, objetos, placas, veios e inimigos.
+// Na primeira visita o nível começa do zero; nas próximas, fica como o jogador deixou.
+static void cav_montar_nivel(Caverna* c) {
+    cav_montar_rocha(c);
+    c->solidos.n = 0;
+    c->n_decor = 0;
+    cav_solidos_da_rocha(c);
+
+    c->fundo = c->fundos[c->nivel - 1];
+    c->minerio = c->minerios[cav_minerio_nivel[c->nivel - 1]];
+    c->veio_bmp = c->veios_img[cav_minerio_nivel[c->nivel - 1]];
+    c->saida = cav_placa_do_lado(cav_entrada_nivel[c->nivel - 1]);
+    c->proximo = cav_placa_do_lado(cav_saida_nivel[c->nivel - 1]);
+
+    // Objetos da caverna (centro x, base y, escala, sólido?)
+    cav_add_decor(c, CAV_IMG_ROCHA_M, 330, 262, 1.5f, 1);
+    cav_add_decor(c, CAV_IMG_CRISTAL_M, 600, 255, 1.5f, 1);
+    cav_add_decor(c, CAV_IMG_ROCHA_G, 930, 268, 1.0f, 1);
+    cav_add_decor(c, CAV_IMG_COGUMELO, 1150, 275, 1.5f, 1);
+    cav_add_decor(c, CAV_IMG_CRISTAL_P, 240, 585, 2.0f, 1);
+    cav_add_decor(c, CAV_IMG_ROCHA_P, 560, 590, 1.5f, 1);
+    cav_add_decor(c, CAV_IMG_COGUMELO, 800, 585, 1.5f, 1);
+    cav_add_decor(c, CAV_IMG_CRISTAL_M, 1060, 580, 1.5f, 1);
+    cav_add_decor(c, CAV_IMG_ESQUELETO, 420, 440, 2.0f, 0);
+    cav_add_decor(c, CAV_IMG_FOGUEIRA, 220, 300, 1.5f, 0);
+
+    // Veios de minério de ferro no chão (x, y = canto superior esquerdo do sprite 64x64)
+    static const float pos_veios[CAV_NUM_VEIOS][2] = {
+        { 300, 430 },{ 540, 400 },{ 650, 340 },{ 880, 400 },{ 1040, 360 },{ 340, 520 }
+    };
+    for (int i = 0; i < CAV_NUM_VEIOS; i++) cav_add_veio(c, i, pos_veios[i][0], pos_veios[i][1]);
+
+    if (c->nivel_visitado[c->nivel - 1]) cav_restaurar_estado(c);
+    else cav_preparar_nivel(c);
+}
+
+// Volta a caverna ao começo: todos os níveis do zero, nível 1 e sem minério
+// (ao carregar o jogo e se o jogador morrer)
+static void cav_resetar(Caverna* c) {
+    for (int k = 0; k < CAV_NUM_NIVEIS; k++) c->nivel_visitado[k] = 0;
+    c->nivel = 1;
+    for (int t = 0; t < NUM_MINERIOS; t++) c->coletados[t] = c->acertos[t] = c->erros[t] = 0;
+    c->aviso_t = 0;
+    c->mudanca = 0;
+    cav_montar_nivel(c);
+}
+
+// Troca de nível: delta = +1 avança, -1 volta. O nível que fica para trás é guardado como está
+// e o minério coletado continua no inventário.
+static void cav_mudar_nivel(Caverna* c, int delta) {
+    int novo = c->nivel + delta;
+    if (novo < 1 || novo > CAV_NUM_NIVEIS) return;
+    cav_guardar_estado(c);
+    c->nivel = novo;
+    c->aviso_t = 0;   // a mensagem do nível anterior não continua no novo
+    cav_montar_nivel(c);
+}
+
+// Diz se o nível atual tem passagem para um próximo
+static int cav_tem_proximo(const Caverna* c) {
+    return cav_saida_nivel[c->nivel - 1] != LADO_NENHUM;
+}
+
+// Coloca o jogador junto da passagem de um lado (sem pisar na placa), virado para dentro da caverna
+static void cav_posicionar_jogador(Player* p, int lado) {
+    static const int linha_da_direcao[4] = { 3, 4, 5, 4 };   // baixo, direita, cima, esquerda
+    float pes_x, pes_y;
+    int dir;
+
+    if (lado == LADO_CIMA)       { pes_x = 740; pes_y = 250; dir = 0; }
+    else if (lado == LADO_BAIXO) { pes_x = 960; pes_y = 560; dir = 2; }
+    else                         { pes_x = 100 + p->hit_x + p->hit_w / 2.0f; pes_y = 330 + p->hit_y + p->hit_h; dir = 1; }
+
+    p->x = pes_x - (p->hit_x + p->hit_w / 2.0f);
+    p->y = pes_y - (p->hit_y + p->hit_h);
+    p->ultima_direcao = dir;
+    p->linha = linha_da_direcao[dir];
+    p->coluna = 0;
+}
+
+static int cav_carregar(Caverna* c, ALLEGRO_DISPLAY* janela) {
+    static const char* arquivos[CAV_NUM_IMGS] = {
+        CAV_PASTA "128/Beige_rpck_dark_shadow1.png",
+        CAV_PASTA "64/Beige_rpck_dark_shadow2.png",
+        CAV_PASTA "64/Beige_rpck_dark_shadow3.png",
+        CAV_PASTA "64/Blue-green_crystal_dark_shadow1.png",
+        CAV_PASTA "32/Blue-green_crystal_dark_shadow3.png",
+        CAV_PASTA "64/mushroom1_dark_shadow1.png",
+        CAV_PASTA "64/Bonefire_dark_shadow.png",
+        CAV_PASTA "32/Human_skeleton_dark_shadow.png"
+    };
+
+    for (int i = 0; i < CAV_NUM_IMGS; i++) {
+        c->img[i] = al_load_bitmap(arquivos[i]);
+        if (!c->img[i]) {
+            printf("ERRO: nao foi possivel carregar %s\n", arquivos[i]);
+            return 0;
+        }
+    }
+
+    c->area = (Retangulo){ 40, 100, 1200, 540 };     // limites da HITBOX do jogador
+
+    srand((unsigned)time(NULL));   // missões e posições dos elementos mudam a cada partida
+
+    for (int t = 0; t < NUM_MINERIOS; t++) {
+        c->minerios[t] = cav_gerar_minerio(janela, t);
+        c->veios_img[t] = cav_gerar_veio(janela, t);
+        if (!c->minerios[t] || !c->veios_img[t]) {
+            printf("ERRO: nao foi possivel gerar o minerio da caverna.\n");
+            return 0;
+        }
+    }
+    c->minerio = c->minerios[MINERIO_FERRO];
+    c->veio_bmp = c->veios_img[MINERIO_FERRO];
+
+    c->esqueleto_bmp = al_load_bitmap("Assets/Skeleton_Archer.png");
+    if (!c->esqueleto_bmp) {
+        printf("ERRO: nao foi possivel carregar Assets/Skeleton_Archer.png\n");
+        return 0;
+    }
+
+    // Um fundo por nível, porque as passagens mudam de lugar
+    for (int k = 1; k <= CAV_NUM_NIVEIS; k++) {
+        c->nivel = k;
+        cav_montar_rocha(c);
+        c->fundos[k - 1] = cav_gerar_fundo(janela, c);
+        if (!c->fundos[k - 1]) {
+            printf("ERRO: nao foi possivel gerar o fundo do nivel %d da caverna.\n", k);
+            return 0;
+        }
+    }
+
+    cav_resetar(c);
+    return 1;
+}
+
+static void cav_destruir(Caverna* c) {
+    if (!c) return;
+    for (int i = 0; i < CAV_NUM_IMGS; i++) {
+        if (c->img[i]) al_destroy_bitmap(c->img[i]);
+        c->img[i] = NULL;
+    }
+    for (int k = 0; k < CAV_NUM_NIVEIS; k++) {
+        if (c->fundos[k]) al_destroy_bitmap(c->fundos[k]);
+        c->fundos[k] = NULL;
+    }
+    for (int t = 0; t < NUM_MINERIOS; t++) {
+        if (c->minerios[t]) al_destroy_bitmap(c->minerios[t]);
+        if (c->veios_img[t]) al_destroy_bitmap(c->veios_img[t]);
+        c->minerios[t] = c->veios_img[t] = NULL;
+    }
+    if (c->esqueleto_bmp) al_destroy_bitmap(c->esqueleto_bmp);
+    // c->fundo, c->minerio e c->veio_bmp eram só os do nível atual (já destruídos acima)
+    c->fundo = c->minerio = c->veio_bmp = c->esqueleto_bmp = NULL;
+}
+
+
+// ------------------------------------------------------------
+// Atualização
+// ------------------------------------------------------------
+// Alcance da picareta: um veio é acertado se estiver a até CAV_ALCANCE_PICARETA pixels
+// dos pés do jogador, em qualquer lado.
+#define CAV_ALCANCE_PICARETA 40.0f
+
+// Devolve o veio mais próximo ao alcance do jogador (-1 se não houver nenhum)
+static int cav_veio_no_alcance(const Caverna* c, const Player* p) {
+    float a = CAV_ALCANCE_PICARETA;
+    float bx = p->x + p->hit_x - a, by = p->y + p->hit_y + p->hit_h - 20 - a;
+    float bw = p->hit_w + 2 * a, bh = 20 + 2 * a;
+    float pcx = p->x + p->hit_x + p->hit_w / 2.0f, pcy = p->y + p->hit_y + p->hit_h / 2.0f;
+    int melhor = -1;
+    float melhor_d = 1e18f;
+
+    for (int i = 0; i < CAV_NUM_VEIOS; i++) {
+        const CavVeio* v = &c->veios[i];
+        if (!v->ativo) continue;
+        if (!colisao(bx, by, bw, bh, v->x + 4, v->y + 4, v->w - 8, v->h - 8)) continue;
+
+        float dx = v->x + v->w / 2.0f - pcx, dy = v->y + v->h / 2.0f - pcy;
+        float d = dx * dx + dy * dy;
+        if (d < melhor_d) { melhor_d = d; melhor = i; }
+    }
+    return melhor;
+}
+
+// Vira o jogador de frente para o veio que vai ser picado
+static void cav_preparar_picareta(const Caverna* c, Player* p) {
+    int i = cav_veio_no_alcance(c, p);
+    if (i < 0) return;
+
+    float dx = c->veios[i].x + c->veios[i].w / 2.0f - (p->x + p->hit_x + p->hit_w / 2.0f);
+    float dy = c->veios[i].y + c->veios[i].h / 2.0f - (p->y + p->hit_y + p->hit_h / 2.0f);
+
+    if (fabsf(dx) > fabsf(dy)) { p->ultima_direcao = (dx > 0) ? 1 : 3; p->linha = 4; }
+    else if (dy > 0) { p->ultima_direcao = 0;                 p->linha = 3; }
+    else { p->ultima_direcao = 2;                 p->linha = 5; }
+}
+
+// Um golpe de picareta: acerta no veio mais próximo que estiver na área do golpe
+static void cav_golpe_nos_veios(Caverna* c, Player* p) {
+    int melhor = cav_veio_no_alcance(c, p);
+    if (melhor < 0) return;
+
+    CavVeio* v = &c->veios[melhor];
+    v->vida--;
+    v->flash = 10;
+    v->tremor = 10;
+
+    if (v->vida <= 0) {
+        v->ativo = 0;
+        if (v->idx_solido >= 0) c->solidos.itens[v->idx_solido].x = -10000.0f;   // libera a passagem
+        c->coletados[v->elemento]++;   // o minério vai para o inventário, certo ou não
+
+        // Missão: era o elemento pedido?
+        int k = c->nivel - 1;
+        int alvo = cav_minerio_nivel[k];
+        const Elemento* e = &ELEMENTOS[v->elemento];
+        const Elemento* certo = &ELEMENTOS[alvo];
+        char txt[96];
+        if (v->elemento == alvo) {
+            c->missao_progresso[k]++;
+            c->acertos[alvo]++;
+            // Reforço: mostra tudo o que identifica o elemento, só no primeiro acerto da missão
+            // (nos seguintes, o progresso já aparece nos quadradinhos do painel)
+            if (c->missao_progresso[k] == 1) {
+                snprintf(txt, sizeof txt, "Certo! %s - %s (%d): %s", e->simbolo, e->nome, e->numero, e->uso);
+                cav_avisar(c, 0, 240, txt);
+            }
+        }
+        else {
+            c->erros[alvo]++;
+            c->missao_erros[k]++;
+            // Diz o que ele quebrou (isso também ensina) e dá uma DICA sobre o elemento certo,
+            // sem entregar a resposta. A dica fica mais forte a cada erro:
+            //   1º erro: outra informação do elemento (diferente da pista da missão)
+            //   2º erro em diante: a primeira letra do símbolo
+            char dica[64];
+            if (c->missao_erros[k] >= 2)
+                snprintf(dica, sizeof dica, "o simbolo comeca com %c", certo->simbolo[0]);
+            else if (c->missao_pista[k] == PISTA_USO)
+                snprintf(dica, sizeof dica, "numero atomico %d", certo->numero);
+            else
+                snprintf(dica, sizeof dica, "%s", certo->uso);
+            snprintf(txt, sizeof txt, "Errado: isso e %s - %s (%d).\nDica: %s",   // \n = duas linhas
+                e->simbolo, e->nome, e->numero, dica);
+            cav_avisar(c, 1, 300, txt);
+            if (p->vida > 0) {   // penalidade: perde 1 de vida
+                p->vida--;
+                p->invulneravel_timer = TEMPO_INVULNERAVEL;
+            }
+        }
+
+        for (int q = 0; q < CAV_MAX_POP; q++) {                                   // ícone subindo
+            if (c->pop[q].t <= 0) {
+                c->pop[q].x = v->x + v->w / 2.0f;
+                c->pop[q].y = v->y + v->h / 2.0f;
+                c->pop[q].t = 45;
+                c->pop[q].elemento = v->elemento;
+                break;
+            }
+        }
+    }
+}
+
+// Retorna: 0 = continua na caverna, 1 = jogador pisou na placa de saída, 2 = jogador morreu,
+//          3 = jogador entrou na passagem para o próximo nível
+// ------------------------------------------------------------
+// Esqueleto arqueiro e flechas
+// ------------------------------------------------------------
+static float esq_centro_x(const Esqueleto* e) { return e->x + e->hit_x + e->hit_w / 2.0f; }
+static float esq_centro_y(const Esqueleto* e) { return e->y + e->hit_y + e->hit_h / 2.0f; }
+
+// Tenta andar (vx, vy); para em paredes, objetos, borda da área e no jogador (só os pés colidem)
+static void esq_andar(const Caverna* c, Esqueleto* e, const Player* p, float vx, float vy) {
+    for (int eixo = 0; eixo < 2; eixo++) {
+        float nx = e->x + (eixo == 0 ? vx : 0), ny = e->y + (eixo == 1 ? vy : 0);
+        float px = nx + e->hit_x, py = ny + e->hit_y + e->hit_h - 10;
+        if (px < c->area.x || px + e->hit_w > c->area.x + c->area.w) continue;
+        if (ny + e->hit_y < c->area.y || ny + e->hit_y + e->hit_h > c->area.y + c->area.h) continue;
+        if (ha_solido_em(&c->solidos, px, py, e->hit_w, 10, NULL)) continue;
+        if (colisao(px, py, e->hit_w, 10, p->x + p->hit_x, p->y + p->hit_y, p->hit_w, p->hit_h)) continue;
+        e->x = nx; e->y = ny;
+    }
+}
+
+// Solta uma flecha do esqueleto na direção do jogador
+static void esq_atirar(Caverna* c, const Esqueleto* e, const Player* p) {
+    float ox = esq_centro_x(e), oy = esq_centro_y(e) - 4;
+    float dx = p->x + p->hit_x + p->hit_w / 2.0f - ox, dy = p->y + p->hit_y + p->hit_h / 2.0f - oy;
+    float d = sqrtf(dx * dx + dy * dy);
+    if (d < 1.0f) return;
+    for (int i = 0; i < CAV_MAX_FLECHAS; i++) {
+        Flecha* f = &c->flechas[i];
+        if (f->ativa) continue;
+        f->ativa = 1;
+        f->x = ox; f->y = oy;
+        f->vx = dx / d * FLECHA_VELOCIDADE;
+        f->vy = dy / d * FLECHA_VELOCIDADE;
+        return;
+    }
+}
+
+static void cav_atualizar_esqueletos(Caverna* c, Player* p) {
+    static const int duracao_ataque[3] = { 18, 18, 14 };   // mirar, puxar, soltar
+
+    for (int i = 0; i < CAV_NUM_ESQUELETOS; i++) {
+        Esqueleto* e = &c->esqueletos[i];
+        if (e->morrendo > 0) { e->morrendo--; continue; }
+        if (e->vida <= 0) continue;
+        if (e->dano_timer > 0) e->dano_timer--;
+        if (e->recarga > 0) e->recarga--;
+
+        float dx = p->x + p->hit_x + p->hit_w / 2.0f - esq_centro_x(e);
+        float dy = p->y + p->hit_y + p->hit_h / 2.0f - esq_centro_y(e);
+        float dist = sqrtf(dx * dx + dy * dy);
+        e->andando = 0;
+
+        if (e->atacando) {
+            // fica parado mirando; solta a flecha quando chega no quadro "soltar"
+            if (++e->contador_ataque >= duracao_ataque[e->quadro_ataque]) {
+                e->contador_ataque = 0;
+                e->quadro_ataque++;
+                if (e->quadro_ataque == 2) esq_atirar(c, e, p);
+                if (e->quadro_ataque >= 3) { e->atacando = 0; e->recarga = ESQ_RECARGA; }
+            }
+        }
+        else if (dist < ESQ_VISAO && dist > 1.0f) {
+            // vira para o jogador
+            e->dir = (fabsf(dx) > fabsf(dy)) ? (dx > 0 ? 1 : 3) : (dy > 0 ? 0 : 2);
+
+            // mantém distância: chega perto se estiver longe, recua se estiver perto
+            float vx = 0, vy = 0;
+            if (dist > ESQ_DIST_MAX) { vx = dx / dist * ESQ_VELOCIDADE; vy = dy / dist * ESQ_VELOCIDADE; }
+            else if (dist < ESQ_DIST_MIN) { vx = -dx / dist * ESQ_VELOCIDADE; vy = -dy / dist * ESQ_VELOCIDADE; }
+            if (vx != 0 || vy != 0) {
+                float ax = e->x, ay = e->y;
+                esq_andar(c, e, p, vx, vy);
+                e->andando = (e->x != ax || e->y != ay);
+            }
+
+            if (e->recarga == 0 && dist <= ESQ_ALCANCE_TIRO) {
+                e->atacando = 1; e->quadro_ataque = 0; e->contador_ataque = 0;
+            }
+        }
+
+        if (++e->contador >= (e->andando ? 8 : 12)) { e->contador = 0; e->quadro = (e->quadro + 1) % 6; }
+    }
+
+    // Golpe de ESPADA acerta esqueletos (a picareta não); um acerto por golpe
+    if (p->atacando && !p->usando_picareta && p->frame_ataque == 0 && p->contador_ataque == 4) {
+        Retangulo g = area_golpe(p);
+        for (int i = 0; i < CAV_NUM_ESQUELETOS; i++) {
+            Esqueleto* e = &c->esqueletos[i];
+            if (e->vida <= 0) continue;
+            if (!colisao(g.x, g.y, g.w, g.h, e->x + e->hit_x, e->y + e->hit_y, e->hit_w, e->hit_h)) continue;
+            e->vida--;
+            e->dano_timer = 12;
+            e->atacando = 0;
+            if (e->vida <= 0) e->morrendo = 32;   // 4 quadros da animação de morte
+            break;
+        }
+    }
+}
+
+// Flechas voam em linha reta; somem ao bater em pedra/objeto/borda; tiram 1 de vida do jogador
+static void cav_atualizar_flechas(Caverna* c, Player* p) {
+    for (int i = 0; i < CAV_MAX_FLECHAS; i++) {
+        Flecha* f = &c->flechas[i];
+        if (!f->ativa) continue;
+        f->x += f->vx;
+        f->y += f->vy;
+
+        if (f->x < 0 || f->y < 0 || f->x > LARGURA_TELA || f->y > ALTURA_TELA) { f->ativa = 0; continue; }
+        if (ha_solido_em(&c->solidos, f->x - 3, f->y - 3, 6, 6, NULL)) { f->ativa = 0; continue; }
+        if (colisao(f->x - 3, f->y - 3, 6, 6, p->x + p->hit_x, p->y + p->hit_y, p->hit_w, p->hit_h)) {
+            if (p->invulneravel_timer == 0 && p->vida > 0) {
+                p->vida--;
+                p->invulneravel_timer = TEMPO_INVULNERAVEL;
+            }
+            f->ativa = 0;
+        }
+    }
+}
+
+static void esq_desenhar(ALLEGRO_BITMAP* folha, const Esqueleto* e) {
+    int linha_dir = (e->dir == 0) ? 0 : (e->dir == 2 ? 2 : 1);   // baixo, lado, cima
+    int flip = (e->dir == 3) ? ALLEGRO_FLIP_HORIZONTAL : 0;      // a folha olha para a direita
+    int linha, coluna;
+
+    if (e->morrendo > 0)        { linha = 6; coluna = 3 - (e->morrendo - 1) / 8; }
+    else if (e->dano_timer > 0) { linha = 7 + linha_dir; coluna = (e->dano_timer / 3) % 2; }
+    else if (e->atacando)       { linha = 10 + linha_dir; coluna = e->quadro_ataque; }
+    else if (e->andando)        { linha = 3 + linha_dir; coluna = e->quadro; }
+    else                        { linha = linha_dir; coluna = e->quadro; }
+
+    al_draw_scaled_bitmap(folha, coluna * 32, linha * 32, 32, 32, e->x, e->y, 96, 96, flip);
+}
+
+static int cav_atualizar(Caverna* c, Player* p) {
+    atualizar_player(p, c->slimes, CAV_NUM_SLIMES, &c->solidos, c->area);
+    cav_atualizar_esqueletos(c, p);
+    cav_atualizar_flechas(c, p);
+
+    // O veio leva o golpe quando a picareta desce (início do 2º quadro da animação)
+    if (p->atacando && p->usando_picareta && p->frame_ataque == 1 && p->contador_ataque == 1) {
+        cav_golpe_nos_veios(c, p);
+    }
+
+    atualizar_slimes(c->slimes, CAV_NUM_SLIMES, p, &c->solidos, c->area);
+
+    for (int i = 0; i < CAV_NUM_VEIOS; i++) {
+        if (c->veios[i].flash > 0) c->veios[i].flash--;
+        if (c->veios[i].tremor > 0) c->veios[i].tremor--;
+    }
+    for (int i = 0; i < CAV_MAX_POP; i++) {
+        if (c->pop[i].t > 0) { c->pop[i].t--; c->pop[i].y -= 1.0f; }
+    }
+
+    if (p->vida <= 0) return 2;
+    if (colisao_pes_rect(p, c->saida, p->x, p->y)) return 1;
+    if (c->aviso_t > 0) c->aviso_t--;
+
+    // Placa de avançar: só abre com a missão completa
+    if (cav_tem_proximo(c) && colisao_pes_rect(p, c->proximo, p->x, p->y)) {
+        if (cav_missao_completa(c)) return 3;
+        if (c->aviso_t < 60) {
+            char txt[96];
+            snprintf(txt, sizeof txt, "A placa esta trancada: complete a missao (faltam %d)",
+                MISSAO_META - c->missao_progresso[c->nivel - 1]);
+            cav_avisar(c, 2, 120, txt);
+        }
+    }
+    return 0;
+}
+
+static int cav_completa(const Caverna* c) {
+    return cav_missao_completa(c);
+}
+
+
+// ------------------------------------------------------------
+// Desenho
+// ------------------------------------------------------------
+static int cav_comparar(const void* a, const void* b) {
+    const CavItem* x = (const CavItem*)a;
+    const CavItem* y = (const CavItem*)b;
+    if (x->base_y != y->base_y) return (x->base_y < y->base_y) ? -1 : 1;
+    if (x->tipo != y->tipo) return (int)x->tipo - (int)y->tipo;
+    return x->indice - y->indice;
+}
+
+// Contador de minério (sem fonte: ícone + um quadradinho por minério)
+static void menu_texto(ALLEGRO_COLOR cor, float x, float y, int esc, int centro, const char* t);
+static int menu_largura(const char* t, int esc);
+
+static void cav_desenhar_hud(const Caverna* c) {
+    // Painel da missão: só o progresso (não mostra o minério, senão daria para achar pela cor)
+    int completa = cav_missao_completa(c);
+    int prog = c->missao_progresso[c->nivel - 1];
+    ALLEGRO_COLOR verde = al_map_rgb(110, 220, 110);
+    float largura = 10 + menu_largura("Missao", 2) + 10 + MISSAO_META * 22 + 6;
+    al_draw_filled_rectangle(12, 12, 12 + largura, 62, al_map_rgba(20, 20, 20, 190));
+    al_draw_rectangle(12, 12, 12 + largura, 62, al_map_rgb(0, 0, 0), 2.0f);
+    menu_texto(completa ? verde : al_map_rgb(240, 230, 200), 22, 30, 2, 0, "Missao");
+
+    float qx = 22 + menu_largura("Missao", 2) + 10;
+    for (int i = 0; i < MISSAO_META; i++) {
+        float x = qx + i * 22;
+        if (i < prog) al_draw_filled_rectangle(x, 28, x + 16, 44, verde);
+        al_draw_rectangle(x, 28, x + 16, 44, al_map_rgb(200, 200, 200), 2.0f);
+    }
+
+    // Pista da missão, embaixo
+    char missao[96];
+    if (completa) snprintf(missao, sizeof missao, "Missao completa! Siga a placa");
+    else cav_texto_missao(c, missao, sizeof missao);
+    float mw = menu_largura(missao, 2) + 20;
+    al_draw_filled_rectangle(12, 68, 12 + mw, 98, al_map_rgba(20, 20, 20, 200));
+    al_draw_rectangle(12, 68, 12 + mw, 98, al_map_rgb(0, 0, 0), 2.0f);
+    menu_texto(completa ? verde : al_map_rgb(255, 255, 255), 22, 76, 2, 0, missao);
+
+    // Número do nível, ao lado do contador
+    char txt[16];
+    snprintf(txt, sizeof txt, "NIVEL %d", c->nivel);
+    float lx = 12 + largura + 10;
+    al_draw_filled_rectangle(lx, 12, lx + 7 * 6 * 3 + 12, 62, al_map_rgba(20, 20, 20, 190));
+    al_draw_rectangle(lx, 12, lx + 7 * 6 * 3 + 12, 62, al_map_rgb(0, 0, 0), 2.0f);
+    menu_texto(al_map_rgb(240, 230, 200), lx + 8, 25, 3, 0, txt);
+}
+
+static void cav_desenhar_veio(const Caverna* c, int i) {
+    const CavVeio* v = &c->veios[i];
+    float off = (v->tremor > 0) ? ((v->tremor % 4 < 2) ? -2.0f : 2.0f) : 0.0f;
+    float x = v->x + off, y = v->y;
+
+    ALLEGRO_BITMAP* bmp = c->veios_img[v->elemento];
+    al_draw_filled_ellipse(v->x + v->w / 2.0f, v->y + v->h * 0.90f, v->w * 0.40f, 7, al_map_rgba(0, 0, 0, 95));
+    al_draw_scaled_bitmap(bmp, 0, 0, 16, 16, x, y, v->w, v->h, 0);
+
+    // Símbolo químico em cima do veio (é por ele que o jogador identifica o elemento)
+    const char* simb = ELEMENTOS[v->elemento].simbolo;
+    float lw = (float)menu_largura(simb, 3), cx = x + v->w / 2.0f;
+    al_draw_filled_rounded_rectangle(cx - lw / 2 - 5, y - 22, cx + lw / 2 + 5, y + 6, 4, 4, al_map_rgba(15, 12, 20, 210));
+    menu_texto(al_map_rgb(255, 255, 255), cx, y - 18, 3, 1, simb);
+
+    // rachaduras conforme leva golpes
+    int dano = CAV_VIDA_VEIO - v->vida;
+    ALLEGRO_COLOR rach = al_map_rgb(20, 16, 22);
+    if (dano >= 1) {
+        al_draw_line(x + v->w * 0.46f, y + v->h * 0.28f, x + v->w * 0.54f, y + v->h * 0.50f, rach, 2.0f);
+        al_draw_line(x + v->w * 0.54f, y + v->h * 0.50f, x + v->w * 0.44f, y + v->h * 0.66f, rach, 2.0f);
+    }
+    if (dano >= 2) {
+        al_draw_line(x + v->w * 0.54f, y + v->h * 0.50f, x + v->w * 0.74f, y + v->h * 0.58f, rach, 2.0f);
+        al_draw_line(x + v->w * 0.30f, y + v->h * 0.40f, x + v->w * 0.40f, y + v->h * 0.56f, rach, 2.0f);
+    }
+
+    // brilho do ferro (pisca de leve)
+    if ((((int)(al_get_time() * 3.0)) + i) % 3 == 0) {
+        al_draw_filled_rectangle(x + v->w * 0.36f, y + v->h * 0.36f, x + v->w * 0.36f + 4, y + v->h * 0.36f + 4, al_map_rgb(255, 235, 200));
+    }
+
+    // clarão ao levar um golpe
+    if (v->flash > 0) {
+        ALLEGRO_STATE st;
+        al_store_state(&st, ALLEGRO_STATE_BLENDER);
+        al_set_blender(ALLEGRO_ADD, ALLEGRO_ALPHA, ALLEGRO_ONE);
+        al_draw_tinted_scaled_bitmap(bmp, al_map_rgba_f(1.0f, 0.8f, 0.5f, 0.07f * v->flash),
+            0, 0, 16, 16, x, y, v->w, v->h, 0);
+        al_restore_state(&st);
+    }
+}
+
+static void cav_desenhar(Caverna* c, Player* p, ALLEGRO_BITMAP* personagem, ALLEGRO_BITMAP* slime_sprite) {
+    al_draw_bitmap(c->fundo, 0, 0, 0);
+    desenhar_placa(c->saida, cav_seta_do_lado(cav_entrada_nivel[c->nivel - 1]));                         // placa de voltar
+    if (cav_tem_proximo(c)) {
+        desenhar_placa(c->proximo, cav_seta_do_lado(cav_saida_nivel[c->nivel - 1]));                     // placa de avançar
+        if (!cav_missao_completa(c)) {   // trancada: X vermelho na tábua até completar a missão
+            float cx = c->proximo.x + c->proximo.w / 2.0f, pe = c->proximo.y + c->proximo.h / 2.0f + 24.0f;
+            ALLEGRO_COLOR vermelho = al_map_rgb(220, 40, 40);
+            al_draw_line(cx - 14, pe - 48, cx + 14, pe - 28, vermelho, 4.0f);
+            al_draw_line(cx + 14, pe - 48, cx - 14, pe - 28, vermelho, 4.0f);
+        }
+    }
+
+    CavItem fila[CAV_MAX_DECOR + CAV_NUM_VEIOS + CAV_NUM_SLIMES + CAV_NUM_ESQUELETOS + 1];
+    int n = 0;
+
+    for (int i = 0; i < c->n_decor; i++) {
+        fila[n].base_y = c->decor[i].base_y; fila[n].tipo = CAV_ITEM_DECOR; fila[n].indice = i; n++;
+    }
+    for (int i = 0; i < CAV_NUM_VEIOS; i++) {
+        if (!c->veios[i].ativo) continue;
+        fila[n].base_y = c->veios[i].y + c->veios[i].h * 0.90f; fila[n].tipo = CAV_ITEM_VEIO; fila[n].indice = i; n++;
+    }
+    for (int i = 0; i < CAV_NUM_SLIMES; i++) {
+        if (c->slimes[i].vida <= 0) continue;
+        fila[n].base_y = c->slimes[i].y + c->slimes[i].hit_y + c->slimes[i].hit_h;
+        fila[n].tipo = CAV_ITEM_SLIME; fila[n].indice = i; n++;
+    }
+    for (int i = 0; i < CAV_NUM_ESQUELETOS; i++) {
+        const Esqueleto* e = &c->esqueletos[i];
+        if (e->vida <= 0 && e->morrendo <= 0) continue;
+        fila[n].base_y = e->y + e->hit_y + e->hit_h;
+        fila[n].tipo = CAV_ITEM_ESQUELETO; fila[n].indice = i; n++;
+    }
+    // Jogador. Durante o golpe de picareta ele fica na frente do veio que está acertando,
+    // senão a pedra cobre a picareta (a base da pedra fica abaixo dos pés do jogador).
+    float base_player = p->y + p->hit_y + p->hit_h;
+    if (p->atacando && p->usando_picareta) {
+        int alvo = cav_veio_no_alcance(c, p);
+        if (alvo >= 0) {
+            float base_veio = c->veios[alvo].y + c->veios[alvo].h * 0.90f;
+            if (base_player <= base_veio) base_player = base_veio + 0.5f;
+        }
+    }
+    fila[n].base_y = base_player; fila[n].tipo = CAV_ITEM_PLAYER; fila[n].indice = 0; n++;
+
+    qsort(fila, n, sizeof(CavItem), cav_comparar);
+
+    for (int k = 0; k < n; k++) {
+        switch (fila[k].tipo) {
+        case CAV_ITEM_DECOR: {
+            const CavDecor* d = &c->decor[fila[k].indice];
+            al_draw_scaled_bitmap(d->bmp, 0, 0, al_get_bitmap_width(d->bmp), al_get_bitmap_height(d->bmp),
+                d->x, d->y, d->w, d->h, 0);
+            break;
+        }
+        case CAV_ITEM_VEIO:   cav_desenhar_veio(c, fila[k].indice); break;
+        case CAV_ITEM_SLIME:  desenhar_slime(&c->slimes[fila[k].indice], slime_sprite); break;
+        case CAV_ITEM_ESQUELETO: esq_desenhar(c->esqueleto_bmp, &c->esqueletos[fila[k].indice]); break;
+        case CAV_ITEM_PLAYER: desenhar_player(p, personagem); break;
+        }
+    }
+
+    // Flechas voando (a flecha da folha aponta para a direita; gira para a direção do voo)
+    for (int i = 0; i < CAV_MAX_FLECHAS; i++) {
+        const Flecha* f = &c->flechas[i];
+        if (!f->ativa) continue;
+        al_draw_tinted_scaled_rotated_bitmap_region(c->esqueleto_bmp, 0, 13 * 32, 32, 32,
+            al_map_rgb(255, 255, 255), 16, 16, f->x, f->y, 3, 3, atan2f(f->vy, f->vx), 0);
+    }
+
+    // Ícone do minério subindo quando é coletado
+    for (int i = 0; i < CAV_MAX_POP; i++) {
+        if (c->pop[i].t <= 0) continue;
+        float a = c->pop[i].t / 45.0f;
+        al_draw_tinted_scaled_bitmap(c->minerios[c->pop[i].elemento], al_map_rgba_f(a, a, a, a),
+            0, 0, 12, 12, c->pop[i].x - 18, c->pop[i].y - 18, 36, 36, 0);
+    }
+
+    // Barras de vida dos slimes por cima de tudo
+    for (int i = 0; i < CAV_NUM_SLIMES; i++) {
+        if (c->slimes[i].vida <= 0) continue;
+        desenhar_barra_vida(c->slimes[i].x + (64 - LARGURA_BARRA_SLIME) / 2.0f, c->slimes[i].y + 10,
+            LARGURA_BARRA_SLIME, ALTURA_BARRA_SLIME, c->slimes[i].vida, VIDA_MAXIMA_SLIME);
+    }
+    for (int i = 0; i < CAV_NUM_ESQUELETOS; i++) {
+        const Esqueleto* e = &c->esqueletos[i];
+        if (e->vida <= 0) continue;
+        desenhar_barra_vida(e->x + (96 - LARGURA_BARRA_SLIME) / 2.0f, e->y + 6,
+            LARGURA_BARRA_SLIME, ALTURA_BARRA_SLIME, e->vida, ESQ_VIDA);
+    }
+
+    cav_desenhar_hud(c);
+
+    // Mensagem de acerto (verde), erro (vermelho) ou aviso (amarelo), embaixo do painel da missão
+    // (do lado esquerdo, onde só tem rocha: não cobre placas nem inimigos)
+    if (c->aviso_t > 0) {
+        float a = (c->aviso_t < 30) ? c->aviso_t / 30.0f : 1.0f;
+        ALLEGRO_COLOR cor = (c->aviso_tipo == 0) ? al_map_rgba_f(0.45f * a, 0.9f * a, 0.45f * a, a)
+                          : (c->aviso_tipo == 1) ? al_map_rgba_f(1.0f * a, 0.45f * a, 0.4f * a, a)
+                                                 : al_map_rgba_f(1.0f * a, 0.86f * a, 0.45f * a, a);
+        // A mensagem pode ter duas linhas, separadas por '\n'
+        char linha1[96], linha2[96] = "";
+        snprintf(linha1, sizeof linha1, "%s", c->aviso);
+        char* quebra = strchr(linha1, '\n');
+        if (quebra) { *quebra = '\0'; snprintf(linha2, sizeof linha2, "%s", quebra + 1); }
+        int linhas = linha2[0] ? 2 : 1;
+
+        float w1 = (float)menu_largura(linha1, 2), w2 = (float)menu_largura(linha2, 2);
+        float w = (w1 > w2 ? w1 : w2) + 20;
+        float h = 14 + 16 * linhas + 4 * (linhas - 1);
+        al_draw_filled_rectangle(12, 104, 12 + w, 104 + h, al_map_rgba_f(0.06f * a, 0.05f * a, 0.08f * a, 0.85f * a));
+        al_draw_rectangle(12, 104, 12 + w, 104 + h, cor, 2.0f);
+        menu_texto(cor, 22, 111, 2, 0, linha1);
+        if (linhas == 2) menu_texto(cor, 22, 131, 2, 0, linha2);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#include <allegro5/allegro.h>
+#include <allegro5/allegro_primitives.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef enum { MENU_JOGAR = 0, MENU_SAIR = 1 } ResultadoMenu;
+
+#define MENU_NUM_BOTOES 2
+#define MENU_NUM_PART   22
+
+typedef struct {
+    float x, y, vel, fase;
+    int esc;
+    const char* simbolo;
+} MenuParticula;
+
+/* ---------- fonte de pixels 5x7 (cada linha = 5 bits) ---------- */
+static const unsigned char menu_glifos[128][8] = {
+    [' '] = { 0 },
+    ['.'] = { 0,0,0,0,0,0x0C,0x0C },
+    [','] = { 0,0,0,0,0x0C,0x04,0x08 },
+    ['!'] = { 0x04,0x04,0x04,0x04,0x04,0,0x04 },
+    [':'] = { 0,0x0C,0x0C,0,0x0C,0x0C,0 },
+    ['-'] = { 0,0,0,0x1F,0,0,0 },
+    ['+'] = { 0,0x04,0x04,0x1F,0x04,0x04,0 },
+    ['('] = { 0x02,0x04,0x08,0x08,0x08,0x04,0x02 },
+    [')'] = { 0x08,0x04,0x02,0x02,0x02,0x04,0x08 },
+    ['/'] = { 0x01,0x01,0x02,0x04,0x08,0x10,0x10 },
+
+    ['0'] = { 0x0E,0x11,0x13,0x15,0x19,0x11,0x0E },
+    ['1'] = { 0x04,0x0C,0x04,0x04,0x04,0x04,0x0E },
+    ['2'] = { 0x0E,0x11,0x01,0x02,0x04,0x08,0x1F },
+    ['3'] = { 0x1E,0x01,0x01,0x0E,0x01,0x01,0x1E },
+    ['4'] = { 0x02,0x06,0x0A,0x12,0x1F,0x02,0x02 },
+    ['5'] = { 0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E },
+    ['6'] = { 0x06,0x08,0x10,0x1E,0x11,0x11,0x0E },
+    ['7'] = { 0x1F,0x01,0x02,0x04,0x08,0x08,0x08 },
+    ['8'] = { 0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E },
+    ['9'] = { 0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C },
+
+    ['A'] = { 0x0E,0x11,0x11,0x1F,0x11,0x11,0x11 },
+    ['B'] = { 0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E },
+    ['C'] = { 0x0E,0x11,0x10,0x10,0x10,0x11,0x0E },
+    ['D'] = { 0x1E,0x11,0x11,0x11,0x11,0x11,0x1E },
+    ['E'] = { 0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F },
+    ['F'] = { 0x1F,0x10,0x10,0x1E,0x10,0x10,0x10 },
+    ['G'] = { 0x0E,0x11,0x10,0x17,0x11,0x11,0x0F },
+    ['H'] = { 0x11,0x11,0x11,0x1F,0x11,0x11,0x11 },
+    ['I'] = { 0x0E,0x04,0x04,0x04,0x04,0x04,0x0E },
+    ['J'] = { 0x07,0x02,0x02,0x02,0x02,0x12,0x0C },
+    ['K'] = { 0x11,0x12,0x14,0x18,0x14,0x12,0x11 },
+    ['L'] = { 0x10,0x10,0x10,0x10,0x10,0x10,0x1F },
+    ['M'] = { 0x11,0x1B,0x15,0x15,0x11,0x11,0x11 },
+    ['N'] = { 0x11,0x19,0x15,0x13,0x11,0x11,0x11 },
+    ['O'] = { 0x0E,0x11,0x11,0x11,0x11,0x11,0x0E },
+    ['P'] = { 0x1E,0x11,0x11,0x1E,0x10,0x10,0x10 },
+    ['Q'] = { 0x0E,0x11,0x11,0x11,0x15,0x12,0x0D },
+    ['R'] = { 0x1E,0x11,0x11,0x1E,0x14,0x12,0x11 },
+    ['S'] = { 0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E },
+    ['T'] = { 0x1F,0x04,0x04,0x04,0x04,0x04,0x04 },
+    ['U'] = { 0x11,0x11,0x11,0x11,0x11,0x11,0x0E },
+    ['V'] = { 0x11,0x11,0x11,0x11,0x11,0x0A,0x04 },
+    ['W'] = { 0x11,0x11,0x11,0x15,0x15,0x1B,0x11 },
+    ['X'] = { 0x11,0x11,0x0A,0x04,0x0A,0x11,0x11 },
+    ['Y'] = { 0x11,0x11,0x0A,0x04,0x04,0x04,0x04 },
+    ['Z'] = { 0x1F,0x01,0x02,0x04,0x08,0x10,0x1F },
+
+    ['a'] = { 0,0,0x0E,0x01,0x0F,0x11,0x0F },
+    ['b'] = { 0x10,0x10,0x16,0x19,0x11,0x11,0x1E },
+    ['c'] = { 0,0,0x0E,0x10,0x10,0x11,0x0E },
+    ['d'] = { 0x01,0x01,0x0D,0x13,0x11,0x11,0x0F },
+    ['e'] = { 0,0,0x0E,0x11,0x1F,0x10,0x0E },
+    ['f'] = { 0x06,0x09,0x08,0x1C,0x08,0x08,0x08 },
+    ['g'] = { 0,0,0x0F,0x11,0x11,0x0F,0x01,0x0E },
+    ['h'] = { 0x10,0x10,0x16,0x19,0x11,0x11,0x11 },
+    ['i'] = { 0x04,0,0x0C,0x04,0x04,0x04,0x0E },
+    ['j'] = { 0x02,0,0x06,0x02,0x02,0x02,0x12,0x0C },
+    ['k'] = { 0x10,0x10,0x12,0x14,0x18,0x14,0x12 },
+    ['l'] = { 0x0C,0x04,0x04,0x04,0x04,0x04,0x0E },
+    ['m'] = { 0,0,0x1A,0x15,0x15,0x15,0x15 },
+    ['n'] = { 0,0,0x16,0x19,0x11,0x11,0x11 },
+    ['o'] = { 0,0,0x0E,0x11,0x11,0x11,0x0E },
+    ['p'] = { 0,0,0x1E,0x11,0x11,0x1E,0x10,0x10 },
+    ['q'] = { 0,0,0x0F,0x11,0x11,0x0F,0x01,0x01 },
+    ['r'] = { 0,0,0x16,0x19,0x10,0x10,0x10 },
+    ['s'] = { 0,0,0x0F,0x10,0x0E,0x01,0x1E },
+    ['t'] = { 0x08,0x08,0x1C,0x08,0x08,0x09,0x06 },
+    ['u'] = { 0,0,0x11,0x11,0x11,0x13,0x0D },
+    ['v'] = { 0,0,0x11,0x11,0x11,0x0A,0x04 },
+    ['w'] = { 0,0,0x11,0x11,0x15,0x15,0x0A },
+    ['x'] = { 0,0,0x11,0x0A,0x04,0x0A,0x11 },
+    ['y'] = { 0,0,0x11,0x11,0x11,0x0F,0x01,0x0E },
+    ['z'] = { 0,0,0x1F,0x02,0x04,0x08,0x1F }
+};
+
+static float menu_rand(float a, float b)
+{
+    return a + (b - a) * ((float)rand() / (float)RAND_MAX);
+}
+
+static int menu_largura(const char* t, int esc)
+{
+    int n = (int)strlen(t);
+    return (n > 0) ? n * 6 * esc - esc : 0;
+}
+
+/* maior escala (<= esc_max) em que o texto cabe em larg_max pixels */
+static int menu_fit(const char* t, float larg_max, int esc_max)
+{
+    int e = esc_max;
+    while (e > 1 && menu_largura(t, e) > larg_max) e--;
+    return e;
+}
+
+/* esc = tamanho de cada "pixel" da fonte; centro=1 centraliza em x */
+static void menu_texto(ALLEGRO_COLOR cor, float x, float y, int esc,
+    int centro, const char* t)
+{
+    const unsigned char* p;
+    float cx = centro ? x - menu_largura(t, esc) / 2.0f : x;
+
+    for (p = (const unsigned char*)t; *p; p++) {
+        if (*p < 128) {
+            const unsigned char* g = menu_glifos[*p];
+            int r, c;
+            for (r = 0; r < 8; r++) {
+                for (c = 0; c < 5; c++) {
+                    if (g[r] & (0x10 >> c)) {
+                        al_draw_filled_rectangle(cx + c * esc, y + r * esc,
+                            cx + (c + 1) * esc,
+                            y + (r + 1) * esc, cor);
+                    }
+                }
+            }
+        }
+        cx += 6 * esc;
+    }
+}
+
+/* Posicao/tamanho do botao i */
+static void menu_botao_rect(int i, int w, int h,
+    float* x, float* y, float* bw, float* bh)
+{
+    *bw = 320;
+    *bh = 56;
+    *x = (w - *bw) / 2.0f;
+    *y = h * 0.62f + i * (*bh + 18);
+}
+
+static void menu_desenhar(MenuParticula* p, int sel, float t, int w, int h)
+{
+    static const char* rotulos[MENU_NUM_BOTOES] = { "JOGAR", "SAIR" };
+    static const char* desc[3] = {
+        "Um jogo educativo criado no PI do 2o semestre para ensinar",
+        "sobre os elementos quimicos e suas curiosidades.",
+        "Explore, minere e descubra os segredos da tabela periodica!"
+    };
+    static const char* curiosidades[3] = {
+        "Curiosidade: o ferro (Fe) e a base do aco, o metal mais usado no mundo.",
+        "Curiosidade: o ouro (Au) nao enferruja, pois e pouco reativo.",
+        "Curiosidade: o hidrogenio (H) e o elemento mais abundante do universo."
+    };
+    const char* titulo = "ELEMENTAL ADVENTURE";
+    const char* subtitulo = "Jogo educativo de Quimica";
+    int i, e;
+    float ty;
+
+    /* fundo em degrade */
+    for (i = 0; i < h; i += 4) {
+        float k = (float)i / (float)h;
+        al_draw_filled_rectangle(0, (float)i, (float)w, (float)i + 4,
+            al_map_rgb(10 + (int)(20 * k), 14 + (int)(30 * k), 40 + (int)(50 * k)));
+    }
+
+    /* simbolos de elementos flutuando */
+    for (i = 0; i < MENU_NUM_PART; i++) {
+        float a = 0.15f + 0.15f * sinf(t * 1.5f + p[i].fase);
+        menu_texto(al_map_rgba_f(0.4f * a, 0.8f * a, 1.0f * a, a),
+            p[i].x, p[i].y, p[i].esc, 1, p[i].simbolo);
+    }
+
+    /* titulo */
+    e = menu_fit(titulo, w * 0.9f, 6);
+    ty = h * 0.10f + 4.0f * sinf(t * 2.0f);
+    menu_texto(al_map_rgb(0, 0, 0), w / 2.0f + e, ty + e, e, 1, titulo);
+    menu_texto(al_map_rgb(255, 205, 70), w / 2.0f, ty, e, 1, titulo);
+
+    e = menu_fit(subtitulo, w * 0.9f, 3);
+    menu_texto(al_map_rgb(140, 210, 255), w / 2.0f, h * 0.10f + 8 * 6 + 24, e, 1, subtitulo);
+
+    /* descricao */
+    e = menu_fit(desc[2], w * 0.92f, 2);
+    for (i = 0; i < 3; i++) {
+        menu_texto(al_map_rgb(225, 235, 250), w / 2.0f,
+            h * 0.38f + i * (8 * e + 14), e, 1, desc[i]);
+    }
+
+    /* botoes */
+    for (i = 0; i < MENU_NUM_BOTOES; i++) {
+        float bx, by, bw, bh;
+        int selecionado = (i == sel);
+        menu_botao_rect(i, w, h, &bx, &by, &bw, &bh);
+
+        al_draw_filled_rounded_rectangle(bx, by, bx + bw, by + bh, 12, 12,
+            selecionado ? al_map_rgb(255, 190, 60) : al_map_rgb(40, 60, 110));
+        al_draw_rounded_rectangle(bx, by, bx + bw, by + bh, 12, 12,
+            selecionado ? al_map_rgb(255, 245, 200) : al_map_rgb(120, 160, 230),
+            3);
+        menu_texto(selecionado ? al_map_rgb(30, 25, 10) : al_map_rgb(255, 255, 255),
+            bx + bw / 2.0f, by + (bh - 7 * 3) / 2.0f, 3, 1, rotulos[i]);
+    }
+
+    /* dica de controles e curiosidade rotativa */
+
+
+    al_flip_display();
+}
+
+/* Roda o menu e devolve MENU_JOGAR ou MENU_SAIR */
+ResultadoMenu tela_inicial(ALLEGRO_DISPLAY* display)
+{
+    static const char* simbolos[MENU_NUM_PART] = {
+        "H", "He", "C", "N", "O", "Fe", "Au", "Na", "Cl", "Ca", "Si",
+        "Cu", "Ag", "Zn", "S", "Al", "Li", "Ne", "K", "Mg", "P", "Pb"
+    };
+    MenuParticula part[MENU_NUM_PART];
+    ALLEGRO_EVENT_QUEUE* fila;
+    ALLEGRO_TIMER* timer;
+    ResultadoMenu res = MENU_SAIR;
+    int w = al_get_display_width(display);
+    int h = al_get_display_height(display);
+    int sel = 0, fim = 0, redesenhar = 1, i;
+    float t = 0.0f;
+
+    al_init_primitives_addon();
+    if (!al_is_keyboard_installed()) al_install_keyboard();
+    if (!al_is_mouse_installed())    al_install_mouse();
+
+    timer = al_create_timer(1.0 / 60.0);
+    fila = al_create_event_queue();
+    if (!timer || !fila) {
+        if (timer) al_destroy_timer(timer);
+        if (fila)  al_destroy_event_queue(fila);
+        return MENU_JOGAR; /* se falhar, segue direto para o jogo */
+    }
+
+    al_register_event_source(fila, al_get_display_event_source(display));
+    al_register_event_source(fila, al_get_keyboard_event_source());
+    al_register_event_source(fila, al_get_mouse_event_source());
+    al_register_event_source(fila, al_get_timer_event_source(timer));
+
+    for (i = 0; i < MENU_NUM_PART; i++) {
+        part[i].x = menu_rand(0, (float)w);
+        part[i].y = menu_rand(0, (float)h);
+        part[i].vel = menu_rand(15, 45);
+        part[i].esc = 2 + rand() % 3;      /* 2, 3 ou 4 */
+        part[i].fase = menu_rand(0, 6.28f);
+        part[i].simbolo = simbolos[i];
+    }
+
+    al_start_timer(timer);
+
+    while (!fim) {
+        ALLEGRO_EVENT ev;
+        al_wait_for_event(fila, &ev);
+
+        switch (ev.type) {
+        case ALLEGRO_EVENT_TIMER:
+            t += 1.0f / 60.0f;
+            for (i = 0; i < MENU_NUM_PART; i++) {
+                part[i].y -= part[i].vel / 60.0f;
+                if (part[i].y < -40) {
+                    part[i].y = (float)h + 30;
+                    part[i].x = menu_rand(0, (float)w);
+                }
+            }
+            redesenhar = 1;
+            break;
+
+        case ALLEGRO_EVENT_DISPLAY_CLOSE:
+            res = MENU_SAIR;
+            fim = 1;
+            break;
+
+        case ALLEGRO_EVENT_KEY_DOWN:
+            if (ev.keyboard.keycode == ALLEGRO_KEY_UP ||
+                ev.keyboard.keycode == ALLEGRO_KEY_W) {
+                sel = (sel + MENU_NUM_BOTOES - 1) % MENU_NUM_BOTOES;
+            }
+            else if (ev.keyboard.keycode == ALLEGRO_KEY_DOWN ||
+                ev.keyboard.keycode == ALLEGRO_KEY_S) {
+                sel = (sel + 1) % MENU_NUM_BOTOES;
+            }
+            else if (ev.keyboard.keycode == ALLEGRO_KEY_ENTER ||
+                ev.keyboard.keycode == ALLEGRO_KEY_PAD_ENTER ||
+                ev.keyboard.keycode == ALLEGRO_KEY_SPACE) {
+                res = (sel == 0) ? MENU_JOGAR : MENU_SAIR;
+                fim = 1;
+            }
+            else if (ev.keyboard.keycode == ALLEGRO_KEY_ESCAPE) {
+                res = MENU_SAIR;
+                fim = 1;
+            }
+            break;
+
+        case ALLEGRO_EVENT_MOUSE_AXES:
+        case ALLEGRO_EVENT_MOUSE_BUTTON_DOWN:
+            for (i = 0; i < MENU_NUM_BOTOES; i++) {
+                float bx, by, bw, bh;
+                menu_botao_rect(i, w, h, &bx, &by, &bw, &bh);
+                if (ev.mouse.x >= bx && ev.mouse.x <= bx + bw &&
+                    ev.mouse.y >= by && ev.mouse.y <= by + bh) {
+                    sel = i;
+                    if (ev.type == ALLEGRO_EVENT_MOUSE_BUTTON_DOWN &&
+                        ev.mouse.button == 1) {
+                        res = (i == 0) ? MENU_JOGAR : MENU_SAIR;
+                        fim = 1;
+                    }
+                }
+            }
+            break;
+        }
+
+        if (!fim && redesenhar && al_is_event_queue_empty(fila)) {
+            menu_desenhar(part, sel, t, w, h);
+            redesenhar = 0;
+        }
+    }
+
+    al_destroy_event_queue(fila);
+    al_destroy_timer(timer);
+    return res;
+}
+
+/* ======================================================================
+ *  Atalho pronto: cria uma janela propria so para o menu, mostra a tela
+ *  inicial e fecha a janela. Funciona sem mexer no resto do seu codigo.
+ *  Chame na PRIMEIRA linha da main():
+ *
+ *        if (menu_inicial_executar() == MENU_SAIR) return 0;
+ * ====================================================================== */
+ResultadoMenu menu_inicial_executar(void)
+{
+    ResultadoMenu res;
+    ALLEGRO_DISPLAY* janela;
+
+    al_init();
+    janela = al_create_display(960, 540);   /* troque o tamanho se quiser */
+    if (!janela) return MENU_JOGAR;         /* se falhar, segue pro jogo  */
+    al_set_window_title(janela, "Elemental Adventure");
+
+    res = tela_inicial(janela);
+
+    al_destroy_display(janela);
+    return res;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 // ============================================================
@@ -241,6 +2083,9 @@ void desenhar_hud(int slot_selecionado);
 // ============================================================
 
 int main() {
+    if (menu_inicial_executar() == MENU_SAIR) return 0;
+
+
 
     ALLEGRO_DISPLAY* janela = NULL;
     ALLEGRO_EVENT_QUEUE* fila = NULL;
@@ -248,6 +2093,7 @@ int main() {
 
     // Bitmaps do exterior
     ALLEGRO_BITMAP* personagem = NULL;
+    ALLEGRO_BITMAP* personagem_acoes = NULL;
     ALLEGRO_BITMAP* grama = NULL;
     ALLEGRO_BITMAP* caminho = NULL;
     ALLEGRO_BITMAP* agua = NULL;
@@ -288,11 +2134,11 @@ int main() {
 
     // Entidades
     Player player;
-    Slime slimes[NUM_SLIMES];
     Animal animais[NUM_ANIMAIS];
 
     // Cena atual e dados da casa
     Cena cena = CENA_EXTERIOR;
+    Cena cena_origem = CENA_EXTERIOR;   // de onde o jogador veio na última troca de cena
     float casa_x = 40, casa_y = 60, casa_w = 0, casa_h = 0;
 
     Retangulo tela_ext = { 0, 0, LARGURA_TELA, ALTURA_TELA };
@@ -305,6 +2151,10 @@ int main() {
     ListaSolidos solidos_int = { 0 }; // tudo que bloqueia a passagem no interior
     ListaCenario cenario = { 0 };     // sprites fixos do exterior (casa, árvores, postes...)
     Retangulo porta_int = { 608, 572, 64, 28 };   // capacho de saída
+
+    // Fase 2: entrada da caverna (placa na ponta esquerda do caminho)
+    Retangulo portal_ext = { 0, CAMINHO_Y, 40, CAMINHO_LINHAS * TILE };
+    Caverna caverna = { 0 };
 
     // Móveis do interior
     Movel moveis[NUM_MOVEIS];
@@ -326,15 +2176,23 @@ int main() {
         return -1;
     }
 
+
+
     al_init_primitives_addon();
     al_init_image_addon();
 
     janela = al_create_display(LARGURA_TELA, ALTURA_TELA);
+    if (!janela) {
+        printf("ERRO: nao foi possivel criar a janela.\n");
+        return -1;
+    }
+
     timer = al_create_timer(1.0 / 60.0);
     fila = al_create_event_queue();
 
     // Carregamento de Sprites do exterior
     personagem = al_load_bitmap("Assets/Player.png");
+    personagem_acoes = al_load_bitmap("Assets/Player_Actions.png");
     grama = al_load_bitmap("Assets/Grass_Middle.png");
     caminho = al_load_bitmap("Assets/Path_Tile.png");
     agua = al_load_bitmap("Assets/Water_Tile.png");
@@ -364,7 +2222,7 @@ int main() {
     int_janela = al_load_bitmap("Assets/Interior_Window.png");
     int_bau = al_load_bitmap("Assets/Interior_Chest.png");
 
-    if (!personagem || !grama || !caminho || !agua || !slime_sprite ||
+    if (!personagem || !personagem_acoes || !grama || !caminho || !agua || !slime_sprite ||
         !arvore || !arvore_pequena || !casa || !bau ||
         !decor || !cerca || !vaca || !porco || !ovelha || !galinha) {
         printf("ERRO: Nao foi possivel carregar um ou mais arquivos da pasta Assets.\n");
@@ -422,6 +2280,12 @@ int main() {
         return -1;
     }
 
+    // Fase 2: carrega os assets da caverna (pasta assets_cave ao lado da pasta Assets)
+    if (!cav_carregar(&caverna, janela)) {
+        printf("ERRO: Nao foi possivel carregar a fase da caverna (pasta assets_cave).\n");
+        return -1;
+    }
+
     // Objetos sólidos: para um objeto novo ter colisão, basta adicioná-lo aqui.
     // A hitbox fica só na base do objeto, para o jogador poder passar atrás da parte de cima.
 
@@ -462,6 +2326,7 @@ int main() {
     animais[1] = (Animal){ porco,   1110, 262, 0.6f, -1, 1, 7, 0,  40, 1034, 1160, 12, 28, 36, 18 };
     animais[2] = (Animal){ galinha, 1060, 296, 0.8f,  1, 0, 3, 0,  75, 1034, 1160, 22, 32, 20, 14 };
     animais[3] = (Animal){ ovelha,   200, 585, 0.5f,  1, 0, 9, 0,  20,  120,  420, 16, 28, 30, 18 };
+
 
     // Sprites fixos, desenhados em ordem de profundidade. A base da casa fica na altura da
     // porta: assim o jogador continua na frente da parede enquanto entra pelo vão.
@@ -504,7 +2369,7 @@ int main() {
 
     // Inicializar Entidades
     init_player(&player);
-    init_slimes(slimes);
+    player.sprite_acoes = personagem_acoes;
 
     // ========================================================
     // LOOP PRINCIPAL DO JOGO
@@ -526,11 +2391,14 @@ int main() {
             case ALLEGRO_KEY_LEFT:  player.esquerda = 1; break;
             case ALLEGRO_KEY_RIGHT: player.direita = 1; break;
             case ALLEGRO_KEY_E:
+                // Espada: acerta slimes, não acerta minério (igual em todas as cenas)
+                if (!player.atacando) iniciar_golpe(&player, 0);
+                break;
+            case ALLEGRO_KEY_Q:
+                // Picareta: funciona em todas as cenas, só quebra minério e não acerta slimes
                 if (!player.atacando) {
-                    player.atacando = 1;
-                    player.frame_ataque = 0;
-                    player.contador_ataque = 0;
-                    player.ataque_acertou = 0;
+                    iniciar_golpe(&player, 1);
+                    if (cena == CENA_CAVERNA) cav_preparar_picareta(&caverna, &player);   // vira para o veio, se houver
                 }
                 break;
             case ALLEGRO_KEY_ESCAPE: sair = 1; break;
@@ -556,22 +2424,59 @@ int main() {
             if (fade_estado == 0) {
                 // Jogo normal
                 if (cena == CENA_EXTERIOR) {
-                    atualizar_player(&player, slimes, NUM_SLIMES, &solidos_ext, tela_ext);
-                    atualizar_slimes(slimes, &player, &solidos_ext);
+                    atualizar_player(&player, NULL, 0, &solidos_ext, tela_ext);   // primeira fase não tem slimes
                     atualizar_animais(animais, &player, &solidos_ext);
 
+                    // Morreu: revive (mesma regra da caverna)
+                    if (player.vida <= 0) {
+                        reviver_player(&player);
+                        cena_destino = CENA_EXTERIOR;
+                        fade_estado = 1;
+                    }
                     // Entrar na casa: basta pisar na porta
-                    if (colisao_pes_rect(&player, porta_ext, player.x, player.y)) {
+                    else if (colisao_pes_rect(&player, porta_ext, player.x, player.y)) {
                         cena_destino = CENA_INTERIOR;
                         fade_estado = 1;
                     }
+                    // Entrar na caverna: basta pisar na placa à esquerda
+                    else if (colisao_pes_rect(&player, portal_ext, player.x, player.y)) {
+                        cena_destino = CENA_CAVERNA;
+                        fade_estado = 1;
+                    }
                 }
-                else {
-                    atualizar_player(&player, slimes, 0, &solidos_int, sala);
+                else if (cena == CENA_INTERIOR) {
+                    atualizar_player(&player, NULL, 0, &solidos_int, sala);
 
                     // Sair da casa: basta pisar no capacho
                     if (colisao_pes_rect(&player, porta_int, player.x, player.y)) {
                         cena_destino = CENA_EXTERIOR;
+                        fade_estado = 1;
+                    }
+                }
+                else {
+                    // CENA_CAVERNA: 0 = continua, 1 = placa de voltar, 2 = morreu, 3 = placa de avançar
+                    int r = cav_atualizar(&caverna, &player);
+                    if (r == 1 && caverna.nivel == 1) {
+                        // Voltar no nível 1: sai da caverna para a fazenda
+                        cena_destino = CENA_EXTERIOR;
+                        fade_estado = 1;
+                    }
+                    else if (r == 1) {
+                        // Voltar: escurece e vai para o nível anterior (a troca acontece no fade)
+                        caverna.mudanca = -1;
+                        cena_destino = CENA_CAVERNA;
+                        fade_estado = 1;
+                    }
+                    else if (r == 2) {
+                        reviver_player(&player);
+                        cav_resetar(&caverna);
+                        cena_destino = CENA_EXTERIOR;
+                        fade_estado = 1;
+                    }
+                    else if (r == 3) {
+                        // Avançar: escurece e vai para o próximo nível (a troca acontece no fade)
+                        caverna.mudanca = +1;
+                        cena_destino = CENA_CAVERNA;
                         fade_estado = 1;
                     }
                 }
@@ -581,12 +2486,34 @@ int main() {
                 fade_alpha += VELOCIDADE_FADE;
                 if (fade_alpha >= 1.0f) {
                     fade_alpha = 1.0f;
+                    cena_origem = cena;
                     cena = cena_destino;
 
                     if (cena == CENA_INTERIOR) {
                         player.x = 640 - (player.hit_x + player.hit_w / 2);
                         player.y = 470;
                         player.ultima_direcao = 2;
+                    }
+                    else if (cena == CENA_CAVERNA) {
+                        if (cena_origem == CENA_CAVERNA) {
+                            // Caverna -> caverna: troca de nível. Avançando, chega pela entrada do
+                            // novo nível; voltando, chega pela saída do nível anterior.
+                            int avancou = (caverna.mudanca > 0);
+                            cav_mudar_nivel(&caverna, caverna.mudanca);
+                            caverna.mudanca = 0;
+                            cav_posicionar_jogador(&player, avancou ? cav_entrada_nivel[caverna.nivel - 1]
+                                                                    : cav_saida_nivel[caverna.nivel - 1]);
+                        }
+                        else {
+                            // Vindo da fazenda: chega pela entrada do nível 1
+                            cav_posicionar_jogador(&player, cav_entrada_nivel[caverna.nivel - 1]);
+                        }
+                    }
+                    else if (cena_origem == CENA_CAVERNA) {
+                        // voltando da caverna: aparece na ponta esquerda do caminho
+                        player.x = 60;
+                        player.y = CAMINHO_Y + 40;
+                        player.ultima_direcao = 1;
                     }
                     else {
                         player.x = porta_ext.x + porta_ext.w / 2 - (player.hit_x + player.hit_w / 2);
@@ -614,32 +2541,24 @@ int main() {
                 // 1. Chão
                 al_draw_bitmap(fundo_ext, 0, 0, 0);
 
-                // 2. Cenário, animais, slimes e jogador, em ordem de profundidade
-                desenhar_exterior(&cenario, animais, slimes, slime_sprite, &player, personagem);
+                // Placa: entrada da caverna
+                desenhar_placa(portal_ext, SETA_ESQUERDA);
 
-                // 3. Barras de vida dos slimes (por cima de tudo, para não sumirem atrás das árvores)
-                for (int i = 0; i < NUM_SLIMES; i++) {
-                    if (slimes[i].vida <= 0) continue;
-
-                    desenhar_barra_vida(
-                        slimes[i].x + (64 - LARGURA_BARRA_SLIME) / 2.0f,
-                        slimes[i].y + 10,
-                        LARGURA_BARRA_SLIME, ALTURA_BARRA_SLIME,
-                        slimes[i].vida, VIDA_MAXIMA_SLIME
-                    );
-                }
+                // 2. Cenário, animais e jogador, em ordem de profundidade
+                desenhar_exterior(&cenario, animais, &player, personagem);
 
                 // DEBUG: descomente para ver as hitboxes
-                // (vermelho = objetos sólidos, verde = gatilho da porta)
+                // (vermelho = objetos sólidos, verde = gatilhos)
                 /*
                 for (int k = 0; k < solidos_ext.n; k++) {
                     Retangulo c = caixa_solido(&solidos_ext.itens[k]);
                     al_draw_rectangle(c.x, c.y, c.x + c.w, c.y + c.h, al_map_rgb(255, 0, 0), 2);
                 }
                 al_draw_rectangle(porta_ext.x, porta_ext.y, porta_ext.x + porta_ext.w, porta_ext.y + porta_ext.h, al_map_rgb(0, 255, 0), 2);
+                al_draw_rectangle(portal_ext.x, portal_ext.y, portal_ext.x + portal_ext.w, portal_ext.y + portal_ext.h, al_map_rgb(0, 255, 0), 2);
                 */
             }
-            else {
+            else if (cena == CENA_INTERIOR) {
                 // Interior: piso e paredes, depois os móveis que ficam ATRÁS do jogador
                 desenhar_interior_fundo(int_piso, int_parede_topo, int_parede_base);
                 desenhar_moveis(moveis, n_moveis, pes_y, 0);
@@ -647,6 +2566,10 @@ int main() {
                 // Jogador e os móveis que ficam NA FRENTE dele
                 desenhar_player(&player, personagem);
                 desenhar_moveis(moveis, n_moveis, pes_y, 1);
+            }
+            else {
+                // Caverna: fundo, objetos, slimes, minérios e jogador (ordenados) + contador
+                cav_desenhar(&caverna, &player, personagem, slime_sprite);
             }
 
             // Barra de vida flutuante do Jogador
@@ -660,7 +2583,7 @@ int main() {
             }
 
             // 4. Interface (HUD)
-            desenhar_hud(slot_selecionado);
+            desenhar_hud(slot_selecionado, caverna.minerios, caverna.coletados, NUM_MINERIOS);
 
             // 5. Fade (por cima de tudo)
             if (fade_alpha > 0.0f) {
@@ -675,7 +2598,10 @@ int main() {
     // FINALIZAÇÃO DE RECURSOS
     // ========================================================
 
+    cav_destruir(&caverna);
+
     al_destroy_bitmap(personagem);
+    al_destroy_bitmap(personagem_acoes);
     al_destroy_bitmap(grama);
     al_destroy_bitmap(caminho);
     al_destroy_bitmap(agua);
@@ -787,6 +2713,35 @@ int ha_solido_em(const ListaSolidos* lista, float x, float y, float w, float h, 
     return 0;
 }
 
+// Começa um golpe: picareta = 1 (tecla Q) ou espada = 0 (tecla E). Vale para todas as cenas.
+void iniciar_golpe(Player* p, int picareta) {
+    p->atacando = 1;
+    p->frame_ataque = 0;
+    p->contador_ataque = 0;
+    p->ataque_acertou = 0;
+    p->usando_picareta = picareta;
+}
+
+// Área que o golpe acerta, à frente do jogador. É a MESMA para a espada e para a picareta,
+// em todas as cenas: mudar o alcance aqui muda as duas ferramentas.
+#define ALCANCE_GOLPE 55.0f
+Retangulo area_golpe(const Player* p) {
+    Retangulo r = { p->x, p->y, (float)p->largura_scaled, (float)p->altura_scaled };
+
+    if (p->ultima_direcao == 1) { r.x += p->largura_scaled - 10; r.w = ALCANCE_GOLPE; }
+    else if (p->ultima_direcao == 3) { r.x -= ALCANCE_GOLPE - 10; r.w = ALCANCE_GOLPE; }
+    else if (p->ultima_direcao == 2) { r.y -= ALCANCE_GOLPE - 10; r.h = ALCANCE_GOLPE; }
+    else { r.y += p->altura_scaled - 10; r.h = ALCANCE_GOLPE; }
+    return r;
+}
+
+// Devolve a vida do jogador depois de morrer (quem chama reinicia a fase e troca de cena)
+void reviver_player(Player* p) {
+    p->vida = VIDA_MAXIMA_PLAYER;
+    p->invulneravel_timer = 0;
+    p->atacando = 0;
+}
+
 void init_player(Player* p) {
     p->x = 600;
     p->y = 450;
@@ -809,29 +2764,12 @@ void init_player(Player* p) {
     p->contador_ataque = 0;
     p->ultima_direcao = 0;
     p->ataque_acertou = 0;
+    p->usando_picareta = 0;
 
     p->hit_x = 30;
     p->hit_y = 14;
     p->hit_w = 36;
     p->hit_h = 62;
-}
-
-void init_slimes(Slime slimes[]) {
-    // Slime 1
-    slimes[0].x = 300; slimes[0].y = 300;
-    slimes[0].velocidade = 1.0f; slimes[0].direcao = 1;
-    slimes[0].frame = 0; slimes[0].contador = 0;
-    slimes[0].limite_esquerda = 200; slimes[0].limite_direita = 450;
-    slimes[0].vida = VIDA_MAXIMA_SLIME; slimes[0].dano_timer = 0;
-    slimes[0].hit_x = 16; slimes[0].hit_y = 20; slimes[0].hit_w = 32; slimes[0].hit_h = 28;
-
-    // Slime 2
-    slimes[1].x = 850; slimes[1].y = 500;
-    slimes[1].velocidade = 1.5f; slimes[1].direcao = -1;
-    slimes[1].frame = 0; slimes[1].contador = 15;
-    slimes[1].limite_esquerda = 700; slimes[1].limite_direita = 1050;
-    slimes[1].vida = VIDA_MAXIMA_SLIME; slimes[1].dano_timer = 0;
-    slimes[1].hit_x = 16; slimes[1].hit_y = 20; slimes[1].hit_w = 32; slimes[1].hit_h = 28;
 }
 
 void atualizar_player(Player* p, Slime slimes[], int n_slimes,
@@ -904,19 +2842,14 @@ void atualizar_player(Player* p, Slime slimes[], int n_slimes,
     if (p->atacando) {
         p->contador_ataque++;
 
-        if (p->contador_ataque == 4 && !p->ataque_acertou) {
-            float atq_x = p->x, atq_y = p->y;
-            float atq_w = p->largura_scaled, atq_h = p->altura_scaled;
-
-            if (p->ultima_direcao == 1) { atq_x += p->largura_scaled - 10; atq_w = 55; }
-            else if (p->ultima_direcao == 3) { atq_x -= 45; atq_w = 55; }
-            else if (p->ultima_direcao == 2) { atq_y -= 45; atq_h = 55; }
-            else if (p->ultima_direcao == 0) { atq_y += p->altura_scaled - 10; atq_h = 55; }
+        // Só a espada acerta slimes; a picareta só quebra minério
+        if (p->contador_ataque == 4 && !p->ataque_acertou && !p->usando_picareta) {
+            Retangulo g = area_golpe(p);
 
             for (int i = 0; i < n_slimes; i++) {
                 if (slimes[i].vida <= 0) continue;
 
-                if (colisao(atq_x, atq_y, atq_w, atq_h, slimes[i].x + slimes[i].hit_x, slimes[i].y + slimes[i].hit_y, slimes[i].hit_w, slimes[i].hit_h)) {
+                if (colisao(g.x, g.y, g.w, g.h, slimes[i].x + slimes[i].hit_x, slimes[i].y + slimes[i].hit_y, slimes[i].hit_w, slimes[i].hit_h)) {
                     slimes[i].vida--;
                     slimes[i].dano_timer = 12;
                     p->ataque_acertou = 1;
@@ -937,45 +2870,75 @@ void atualizar_player(Player* p, Slime slimes[], int n_slimes,
     }
 }
 
-void atualizar_slimes(Slime slimes[], Player* p, const ListaSolidos* solidos) {
-    for (int i = 0; i < NUM_SLIMES; i++) {
-        if (slimes[i].vida <= 0) continue;
+// Diz se o slime (já na posição de teste) bateu no jogador, em objeto sólido ou na borda da área
+static int slime_bateu(const Slime* t, Player* p, const ListaSolidos* solidos, Retangulo area) {
+    float hx = t->x + t->hit_x, hy = t->y + t->hit_y;
 
-        float prox_x = slimes[i].x + slimes[i].velocidade * slimes[i].direcao;
-        Slime teste = slimes[i];
-        teste.x = prox_x;
+    if (colisao_player_slime(p, (Slime*)t, p->x, p->y)) return 1;
+    if (hx < area.x || hy < area.y || hx + t->hit_w > area.x + area.w || hy + t->hit_h > area.y + area.h) return 1;
+    return ha_solido_em(solidos, hx, hy, t->hit_w, t->hit_h, NULL);
+}
 
-        // Bateu no jogador?
-        int bateu = colisao_player_slime(p, &teste, p->x, p->y);
+// Comportamento dos slimes, igual em todas as fases: patrulham, perseguem o jogador
+// quando ele chega perto e tiram vida ao encostar
+void atualizar_slimes(Slime slimes[], int n_slimes, Player* p, const ListaSolidos* solidos, Retangulo area) {
+    for (int i = 0; i < n_slimes; i++) {
+        Slime* s = &slimes[i];
+        if (s->vida <= 0) continue;
 
-        // Bateu em algum objeto sólido (casa, árvores, etc.)?
-        if (!bateu) {
-            bateu = ha_solido_em(solidos, teste.x + teste.hit_x, teste.y + teste.hit_y, teste.hit_w, teste.hit_h, NULL);
-        }
+        float pcx = p->x + p->hit_x + p->hit_w / 2.0f;
+        float pcy = p->y + p->hit_y + p->hit_h / 2.0f;
+        float scx = s->x + s->hit_x + s->hit_w / 2.0f;
+        float scy = s->y + s->hit_y + s->hit_h / 2.0f;
+        float dx = pcx - scx, dy = pcy - scy;
+        float dist = sqrtf(dx * dx + dy * dy);
 
-        if (bateu) {
-            slimes[i].direcao *= -1;
+        // Perto do jogador: persegue. Longe: patrulha na horizontal.
+        int perseguindo = (dist < RAIO_PERSEGUIR_SLIME && dist > 1.0f);
+        float vx, vy;
+        if (perseguindo) {
+            float v = s->velocidade * 1.3f;
+            vx = dx / dist * v;
+            vy = dy / dist * v;
         }
         else {
-            slimes[i].x = prox_x;
+            vx = s->velocidade * s->direcao;
+            vy = 0;
         }
 
-        if (slimes[i].x <= slimes[i].limite_esquerda) {
-            slimes[i].x = slimes[i].limite_esquerda;
-            slimes[i].direcao = 1;
-        }
-        if (slimes[i].x >= slimes[i].limite_direita) {
-            slimes[i].x = slimes[i].limite_direita;
-            slimes[i].direcao = -1;
+        // Eixo X
+        Slime t = *s;
+        t.x += vx;
+        int bateu_x = slime_bateu(&t, p, solidos, area);
+        if (bateu_x) { if (!perseguindo) s->direcao *= -1; }
+        else s->x = t.x;
+
+        // Eixo Y
+        t = *s;
+        t.y += vy;
+        if (!slime_bateu(&t, p, solidos, area)) s->y = t.y;
+
+        // Limites da patrulha: se saiu deles perseguindo o jogador, volta andando (sem teleportar).
+        // Se acabou de bater em algo, mantém a meia-volta para não ficar empurrando o obstáculo.
+        if (!perseguindo && !bateu_x) {
+            if (s->x <= s->limite_esquerda) s->direcao = 1;
+            if (s->x >= s->limite_direita) s->direcao = -1;
         }
 
-        slimes[i].contador++;
-        if (slimes[i].contador >= 10) {
-            slimes[i].frame = (slimes[i].frame + 1) % 4;
-            slimes[i].contador = 0;
+        // Encostou no jogador: tira vida (com invulnerabilidade)
+        if (p->invulneravel_timer == 0 && p->vida > 0 &&
+            colisao(p->x + p->hit_x - 4, p->y + p->hit_y - 4, p->hit_w + 8, p->hit_h + 8,
+                s->x + s->hit_x, s->y + s->hit_y, s->hit_w, s->hit_h)) {
+            p->vida--;
+            p->invulneravel_timer = TEMPO_INVULNERAVEL;
         }
 
-        if (slimes[i].dano_timer > 0) slimes[i].dano_timer--;
+        s->contador++;
+        if (s->contador >= 10) {
+            s->frame = (s->frame + 1) % 4;
+            s->contador = 0;
+        }
+        if (s->dano_timer > 0) s->dano_timer--;
     }
 }
 
@@ -1167,10 +3130,9 @@ static int comparar_itens(const void* a, const void* b) {
 }
 
 // Desenha tudo que fica em pé no exterior, de trás para a frente
-void desenhar_exterior(const ListaCenario* cenario, Animal animais[], Slime slimes[],
-    ALLEGRO_BITMAP* slime_sprite, Player* p, ALLEGRO_BITMAP* personagem) {
+void desenhar_exterior(const ListaCenario* cenario, Animal animais[], Player* p, ALLEGRO_BITMAP* personagem) {
 
-    ItemDesenho fila[MAX_SPRITES + NUM_ANIMAIS + NUM_SLIMES + 1];
+    ItemDesenho fila[MAX_SPRITES + NUM_ANIMAIS + 1];
     int n = 0;
 
     for (int i = 0; i < cenario->n; i++) {
@@ -1179,11 +3141,8 @@ void desenhar_exterior(const ListaCenario* cenario, Animal animais[], Slime slim
     for (int i = 0; i < NUM_ANIMAIS; i++) {
         fila[n++] = (ItemDesenho){ animais[i].y + animais[i].hit_y + animais[i].hit_h, ITEM_ANIMAL, i };
     }
-    for (int i = 0; i < NUM_SLIMES; i++) {
-        if (slimes[i].vida <= 0) continue;
-        fila[n++] = (ItemDesenho){ slimes[i].y + slimes[i].hit_y + slimes[i].hit_h, ITEM_SLIME, i };
-    }
     fila[n++] = (ItemDesenho){ p->y + p->hit_y + p->hit_h, ITEM_PLAYER, 0 };
+
 
     qsort(fila, n, sizeof(ItemDesenho), comparar_itens);
 
@@ -1195,7 +3154,6 @@ void desenhar_exterior(const ListaCenario* cenario, Animal animais[], Slime slim
             break;
         }
         case ITEM_ANIMAL: desenhar_animal(&animais[fila[i].indice]); break;
-        case ITEM_SLIME:  desenhar_slime(&slimes[fila[i].indice], slime_sprite); break;
         case ITEM_PLAYER: desenhar_player(p, personagem); break;
         }
     }
@@ -1216,8 +3174,20 @@ void desenhar_slime(Slime* s, ALLEGRO_BITMAP* sprite) {
 void desenhar_player(Player* p, ALLEGRO_BITMAP* sprite) {
     if (p->invulneravel_timer % 10 >= 5) return;   // pisca enquanto está invulnerável
 
-    int flip = (p->ultima_direcao == 3) ? ALLEGRO_FLIP_HORIZONTAL : 0;
+    int flip = (p->ultima_direcao == 3) ? ALLEGRO_FLIP_HORIZONTAL : 0;   // as duas folhas olham para a direita
     int coluna = p->coluna, linha = p->linha;
+
+    // Picareta: a folha tem quadros de 48x48 (Player.png usa 32x32) e cada linha tem 2 quadros,
+    // levanta e bate. O personagem fica 8 px mais para dentro do quadro, por isso o ajuste.
+    if (p->atacando && p->usando_picareta) {
+        int linha_acao = (p->ultima_direcao == 0) ? 1 : (p->ultima_direcao == 2) ? 2 : 0;   // baixo, cima, lado
+        float tam = 48.0f * p->escala;
+        float ajuste = 8.0f * p->escala;
+
+        al_draw_scaled_bitmap(p->sprite_acoes, p->frame_ataque * 48, linha_acao * 48, 48, 48,
+            p->x - ajuste, p->y - ajuste, tam, tam, flip);
+        return;
+    }
 
     if (p->atacando) {
         coluna = p->frame_ataque;
@@ -1307,7 +3277,10 @@ void desenhar_interior_fundo(ALLEGRO_BITMAP* piso, ALLEGRO_BITMAP* parede_topo, 
 void desenhar_moveis(Movel moveis[], int n, float pes_y, int depois_do_player) {
     for (int i = 0; i < n; i++) {
         Movel* m = &moveis[i];
-        int atras = m->plano || (m->y + m->h) <= pes_y;
+
+        int atras = 0;
+        if (m->plano) atras = 1;
+        else if ((m->y + m->h) <= pes_y) atras = 1;
 
         if ((!depois_do_player && atras) || (depois_do_player && !atras)) {
             al_draw_scaled_bitmap(
@@ -1318,7 +3291,36 @@ void desenhar_moveis(Movel moveis[], int n, float pes_y, int depois_do_player) {
     }
 }
 
-void desenhar_hud(int slot_selecionado) {
+// Dígitos 3x5 desenhados com retângulos (o jogo não usa fonte)
+static const unsigned char DIGITOS_3X5[10][5] = {
+    { 7,5,5,5,7 },{ 2,6,2,2,7 },{ 7,1,7,4,7 },{ 7,1,7,1,7 },{ 5,5,7,1,1 },
+    { 7,4,7,1,7 },{ 7,4,7,5,7 },{ 7,1,1,1,1 },{ 7,5,7,5,7 },{ 7,5,7,1,7 }
+};
+
+static void desenhar_numero(float x, float y, int n, int esc) {
+    char txt[16];
+    snprintf(txt, sizeof(txt), "%d", n);
+
+    for (int passo = 0; passo < 2; passo++) {   // passo 0 = sombra, passo 1 = número
+        ALLEGRO_COLOR cor = passo == 0 ? al_map_rgb(0, 0, 0) : al_map_rgb(255, 255, 255);
+        float desl = passo == 0 ? (float)esc : 0.0f;
+
+        for (int i = 0; txt[i]; i++) {
+            int d = txt[i] - '0';
+            for (int r = 0; r < 5; r++) {
+                for (int col = 0; col < 3; col++) {
+                    if (DIGITOS_3X5[d][r] & (4 >> col)) {
+                        float px = x + desl + (i * 4 + col) * esc;
+                        float py = y + desl + r * esc;
+                        al_draw_filled_rectangle(px, py, px + esc, py + esc, cor);
+                    }
+                }
+            }
+        }
+    }
+}
+// icones[i] e qtd[i] = item que fica no slot i (slot 1 = ferro, slot 2 = ouro...)
+void desenhar_hud(int slot_selecionado, ALLEGRO_BITMAP* const icones[], const int qtd[], int n_itens) {
     int largura_total = (NUM_SLOTS * TAMANHO_SLOT) + ((NUM_SLOTS - 1) * ESPACO_SLOT);
     int inicio_x = (LARGURA_TELA - largura_total) / 2;
     int inicio_y = ALTURA_TELA - 70;
@@ -1334,5 +3336,17 @@ void desenhar_hud(int slot_selecionado) {
         else {
             al_draw_rectangle(slot_x, inicio_y, slot_x + TAMANHO_SLOT, inicio_y + TAMANHO_SLOT, al_map_rgb(20, 20, 20), 2.0);
         }
+    }
+
+    // Minérios carregados (aparecem em qualquer cena): slot 1 = ferro, slot 2 = ouro
+    for (int i = 0; i < n_itens && i < NUM_SLOTS; i++) {
+        if (qtd[i] <= 0 || !icones[i]) continue;
+        int slot_x = inicio_x + (i * (TAMANHO_SLOT + ESPACO_SLOT));
+        al_draw_scaled_bitmap(icones[i], 0, 0, 12, 12, slot_x + 7, inicio_y + 7, 36, 36, 0);
+
+        int digitos = 1;
+        for (int t = qtd[i]; t >= 10; t /= 10) digitos++;
+        float larg = (digitos * 4 - 1) * 2.0f;
+        desenhar_numero(slot_x + TAMANHO_SLOT - 4 - larg, inicio_y + TAMANHO_SLOT - 4 - 10.0f, qtd[i], 2);
     }
 }
